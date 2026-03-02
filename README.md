@@ -24,7 +24,11 @@ By calculating the Black-Scholes Gamma for current option chains, this tool visu
 * 🛡️ **Rate-Limit Protected:** Includes error handling to detect and warn you if Yahoo Finance temporarily blocks your IP.
 
 ---
-
+code
+Markdown
+download
+content_copy
+expand_less
 ## 🛠️ Installation & Requirements
 
 You will need Python installed on your system. To install the required libraries, run the following command in your terminal:
@@ -81,6 +85,4 @@ Code
 download
 content_copy
 expand_less
-### 💡 Pro-Tip on GitHub Colors:
-GitHub officially disabled standard HTML colors (like `<font color="red">`) in READMEs for security and theme-compatibility reasons (Dark Mode vs Light Mode). 
-Using **Emojis (🟢 🔴 ⚪)** and **Blockquotes (`>`)** as I did above is the modern, official way to add "color" and structural pop to GitHub documentation so it looks perfect on any device!
+Once you paste that, GitHub will read the ` ``` ` backticks correctly, the code blocks will close properly, and the rest of your headers and colors will pop back out into standard text!
