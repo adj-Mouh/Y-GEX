@@ -29,7 +29,6 @@ By calculating the Black-Scholes Gamma for current option chains, this tool visu
 
 You will need Python installed on your system. To install the required libraries, run the following command in your terminal:
 
-```bash
 pip install yfinance pandas numpy scipy matplotlib
 🚀 How to Use
 
