@@ -5,7 +5,7 @@
 
 By calculating the Black-Scholes Gamma for current option chains, this tool visualizes where Market Makers are positioned, helping you spot heavy support/resistance levels and potential volatility zones in real-time.
 
-![GEX Tracker Screenshot](image.png)
+![GEX Tracker Screenshot](GEX.png)
 
 ---
 
