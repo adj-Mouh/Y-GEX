@@ -1,3 +1,5 @@
+![GEX Tracker Screenshot](image.png)
+
 Here is a sleek, formatted README.md file tailored for your GitHub repository. It uses standard GitHub Markdown (Headers, Bold, Italic, Code Blocks, Emojis, and some formatting tricks) to make it look professional and colorful!
 
 Copy and paste the text below into your README.md file:
