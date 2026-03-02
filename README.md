@@ -57,7 +57,7 @@ Indices: To plot major indices, just type SPX, NDX, VIX, or RUT. The tool handle
 
 Hit Enter, click Plot GEX, or select an item from the dropdown to instantly load the new options chain.
 
-📊 How to Read the Chart
+## 📊 How to Read the Chart
 
 The chart displays the Net Gamma Exposure (in Billions of dollars) on the X-axis, and the Strike Price on the Y-axis.
 
@@ -70,7 +70,7 @@ Dealers are Short Gamma. If the price drops into these zones, dealers are forced
 ⚪ Dotted White Line
 The current, live Spot Price of the underlying asset.
 
-⚠️ Disclaimer
+##⚠️ Disclaimer
 
 This script pulls data from Yahoo Finance's unofficial API (yfinance). If you set the DATA_REFRESH_SEC too low (e.g., updating every 0.5 seconds), Yahoo may temporarily rate-limit or block your IP address. A safe refresh rate is between 2 to 10 seconds.
 
