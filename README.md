@@ -24,11 +24,7 @@ By calculating the Black-Scholes Gamma for current option chains, this tool visu
 * 🛡️ **Rate-Limit Protected:** Includes error handling to detect and warn you if Yahoo Finance temporarily blocks your IP.
 
 ---
-code
-Markdown
-download
-content_copy
-expand_less
+
 ## 🛠️ Installation & Requirements
 
 You will need Python installed on your system. To install the required libraries, run the following command in your terminal:
