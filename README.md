@@ -50,7 +50,7 @@ Python
 download
 content_copy
 expand_less
-# --- 1. SETTINGS ---
+# . SETTINGS ---
 TICKER = "QQQ"           # Change this to AAPL, TSLA, NVDA, etc.
 DATA_REFRESH_SEC = 2     # How often to download new data
 📊 How to Read the Chart
