@@ -63,7 +63,7 @@ Dealers are Short Gamma. If the price drops into these zones, dealers are forced
 ⚪ Dotted White Line
 The current, live Spot Price of the underlying asset.
 
-##⚠️ Disclaimer
+## ⚠️ Disclaimer
 
 This script pulls data from Yahoo Finance's unofficial API (yfinance). If you set the DATA_REFRESH_SEC too low (e.g., updating every 0.5 seconds), Yahoo may temporarily rate-limit or block your IP address. A safe refresh rate is between 2 to 10 seconds.
 
