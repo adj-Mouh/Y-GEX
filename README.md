@@ -44,13 +44,6 @@ Clone or download the script.
 
 Run the script via your terminal or IDE:
 
-code
-Bash
-download
-content_copy
-expand_less
-python y-gex.py
-
 Select an Asset: Use the text box at the top to type a ticker (e.g., AAPL, TSLA, NVDA). The tool will auto-suggest popular tickers as you type.
 
 Indices: To plot major indices, just type SPX, NDX, VIX, or RUT. The tool handles the Yahoo Finance formatting automatically.
@@ -76,8 +69,3 @@ This script pulls data from Yahoo Finance's unofficial API (yfinance). If you se
 
 Not Financial Advice. This tool is for educational and research purposes only. Options trading carries significant risk.
 
-code
-Code
-download
-content_copy
-expand_less
