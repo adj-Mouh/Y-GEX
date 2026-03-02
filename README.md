@@ -1,14 +1,4 @@
-Here is the updated, sleek README.md formatted to reflect the new interactive GUI, search bar, and instant-loading updates.
 
-I also cleaned up the weird artifacts (content_copy, expand_less, etc.) from your previous copy-paste so this will format perfectly on GitHub.
-
-Copy and paste the text below into your README.md file:
-
-code
-Markdown
-download
-content_copy
-expand_less
 # 📈 Live GEX (Gamma Exposure) Profile Tracker
 
 > A blazing-fast, interactive Python GUI that calculates and visualizes real-time Gamma Exposure (GEX) for options markets.
@@ -38,7 +28,7 @@ pip install yfinance pandas numpy scipy matplotlib
 
 (Note: tkinter is used for the GUI and comes pre-installed with standard Python. Linux users may need to run sudo apt install python3-tk if it is missing).
 
-🚀 How to Use
+## 🚀 How to Use
 
 Clone or download the script.
 
