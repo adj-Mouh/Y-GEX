@@ -4,386 +4,505 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.ComponentModel.DataAnnotations;
 using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
-using System.Windows;
 using System.Windows.Input;
 using System.Windows.Media;
-using System.Xml.Serialization;
+using System.IO;
+using System.Globalization;
 using NinjaTrader.Cbi;
 using NinjaTrader.Gui;
 using NinjaTrader.Gui.Chart;
-using NinjaTrader.Gui.SuperDom;
-using NinjaTrader.Gui.Tools;
 using NinjaTrader.Data;
 using NinjaTrader.NinjaScript;
-using NinjaTrader.Core.FloatingPoint;
-using NinjaTrader.NinjaScript.DrawingTools;
-using System.IO;
-using System.Globalization;
 using System.Windows.Threading;
-using SharpDX;
 using SharpDX.Direct2D1;
+using SharpDX.DirectWrite;
+using SharpDX;
 #endregion
 
 namespace NinjaTrader.NinjaScript.Indicators
 {
-	public class GEXReader : Indicator
+	public class GexHeatmap : Indicator
 	{
-		#region Data Structures
-		
-		public class GexLevel
+		#region Helper Classes & Structs
+		public class OptionData
 		{
-			public double Strike { get; set; }
-			public double GexBillions { get; set; }
+			public DateTime Expiration;
+			public bool IsCall;
+			public double Strike;
+			public int OI;
+			public double IV;
 		}
 
 		public class GexSnapshot
 		{
-			public DateTime Timestamp { get; set; }
-			public double SpotPrice { get; set; }
-			public List<GexLevel> Levels { get; set; }
-			
-			public double TotalGex 
-			{ 
-				get 
-				{ 
-					double sum = 0;
-					if (Levels != null)
-					{
-						foreach(GexLevel level in Levels)
-							sum += level.GexBillions;
-					}
-					return sum;
-				} 
-			}
-
-			public GexSnapshot()
-			{
-				Levels = new List<GexLevel>();
-			}
+			public DateTime Timestamp;
+			public Dictionary<double, List<OptionData>> Strikes = new Dictionary<double, List<OptionData>>();
 		}
-		
+
+		public class GexBarData
+		{
+			public Dictionary<double, double> StrikeToNetGex = new Dictionary<double, double>();
+			public Dictionary<double, int> StrikeToTotalOI = new Dictionary<double, int>();
+		}
+
+		private class GexHitInfo
+		{
+			public SharpDX.RectangleF Bounds;
+			public double Strike;
+			public double NetGex;
+			public int TotalOI;
+		}
 		#endregion
 
 		#region Variables
-		
-		private string dataDirectory;
-		private DispatcherTimer fileReaderTimer;
-		
-		// Thread-safe lock for reading/rendering data simultaneously
-		private object dataLock = new object();
-		
-		// Sorted list of times and Dictionary for fast lookups
-		private List<DateTime> sortedTimestamps = new List<DateTime>();
-		private Dictionary<DateTime, GexSnapshot> historicalGexProfiles = new Dictionary<DateTime, GexSnapshot>();
-		
-		private long lastFilePosition = 0;
-		private string currentLoadedDateStr = "";
+		private List<GexSnapshot> historicalSnapshots;
+		private Series<GexBarData> gexSeries;
+		private bool isDataLoaded = false;
 
-		// Direct2D Rendering Brushes
-		private SharpDX.Direct2D1.SolidColorBrush posGexBrush;
-		private SharpDX.Direct2D1.SolidColorBrush negGexBrush;
+		private SharpDX.Direct2D1.SolidColorBrush[] positiveBrushes; 
+		private SharpDX.Direct2D1.SolidColorBrush[] negativeBrushes; 
 		
+		private List<GexHitInfo> hitTestList = new List<GexHitInfo>();
+		private GexHitInfo hoveredCell = null;
+		private DispatcherTimer hoverTimer;
+		private bool showTooltip = false;
+		private bool isMouseSubscribed = false;
+		private SharpDX.Vector2 mousePosition;
+
+		private SharpDX.DirectWrite.TextFormat tooltipTextFormat;
+		private SharpDX.Direct2D1.SolidColorBrush tooltipBgBrush;
+		private SharpDX.Direct2D1.SolidColorBrush tooltipBorderBrush;
+		private SharpDX.Direct2D1.SolidColorBrush tooltipTextBrush;
 		#endregion
 
+		#region Parameters
+		[NinjaScriptProperty]
+		[Display(Name="CSV Folder Path", Description="Full path to the folder containing Options CSVs.", Order=1, GroupName="Parameters")]
+		public string CsvFolderPath { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name="Ticker Override", Description="Force read a specific ticker (e.g. SPX) regardless of chart symbol.", Order=2, GroupName="Parameters")]
+		public string TickerOverride { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(0.1, 100)]
+		[Display(Name="Strike Interval", Description="Spacing between strikes (e.g. 5 for SPX, 1 for SPY). Used for drawing height.", Order=3, GroupName="Parameters")]
+		public double StrikeInterval { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(0, 100)]
+		[Display(Name="Filter Cutoff %", Description="Hide cells with GEX lower than this percentage of the max.", Order=4, GroupName="Parameters")]
+		public double CutoffPercent { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, 120)]
+		[Display(Name="Max Data Age (Min)", Description="Stop plotting if CSV data is older than this (prevents stretching).", Order=5, GroupName="Parameters")]
+		public int MaxDataAgeMinutes { get; set; }
+		#endregion
+
+		#region State Management
 		protected override void OnStateChange()
 		{
 			if (State == State.SetDefaults)
 			{
-				Description									= @"Reads Python GEX CSV data and plots a simple Heatmap.";
-				Name										= "GEX Visualizer";
+				Description									= @"Visualizes Gamma Exposure (GEX) dynamically.";
+				Name										= "GEX Heatmap Engine";
 				Calculate									= Calculate.OnBarClose;
 				IsOverlay									= true;
 				DisplayInDataBox							= false;
 				DrawOnPricePanel							= true;
-
-				GexTicker = "SPX"; 
-				RefreshSeconds = 5;
-				GexOpacity = 80;
+				PaintPriceMarkers							= true;
+				ScaleJustification							= NinjaTrader.Gui.Chart.ScaleJustification.Right;
+				
+				CsvFolderPath								= @"C:\Options_History_Data";
+				TickerOverride                              = ""; 
+				StrikeInterval								= 5.0; 
+				CutoffPercent								= 2.0; 
+				MaxDataAgeMinutes							= 5; 
+			}
+			else if (State == State.Configure)
+			{
+				// NEW: Force the ZOrder to be -1, effectively placing it behind the candles
+				ZOrder = -1;
 			}
 			else if (State == State.DataLoaded)
 			{
-				dataDirectory = Path.Combine(NinjaTrader.Core.Globals.UserDataDir, "GEX_Data");
-				historicalGexProfiles = new Dictionary<DateTime, GexSnapshot>();
-				sortedTimestamps = new List<DateTime>();
+				historicalSnapshots = new List<GexSnapshot>();
+				gexSeries = new Series<GexBarData>(this, MaximumBarsLookBack.Infinite);
+				positiveBrushes = new SharpDX.Direct2D1.SolidColorBrush[256];
+				negativeBrushes = new SharpDX.Direct2D1.SolidColorBrush[256];
 
-				if (ChartControl != null)
+				LoadGexDataFromCsv();
+			}
+			else if (State == State.Historical)
+			{
+				if (ChartControl != null && !isMouseSubscribed)
 				{
-					ChartControl.Dispatcher.InvokeAsync((Action)(() =>
-					{
-						fileReaderTimer = new DispatcherTimer();
-						fileReaderTimer.Interval = TimeSpan.FromSeconds(RefreshSeconds);
-						fileReaderTimer.Tick += ReadLatestGexData;
-						fileReaderTimer.Start();
-						
-						ReadLatestGexData(null, null);
-					}));
+					ChartControl.MouseMove += OnChartMouseMove;
+					isMouseSubscribed = true;
 				}
 			}
 			else if (State == State.Terminated)
 			{
-				if (fileReaderTimer != null)
+				if (ChartControl != null && isMouseSubscribed)
 				{
-					fileReaderTimer.Stop();
-					fileReaderTimer.Tick -= ReadLatestGexData;
-					fileReaderTimer = null;
+					ChartControl.MouseMove -= OnChartMouseMove;
+					isMouseSubscribed = false;
 				}
+				if (hoverTimer != null) { hoverTimer.Stop(); hoverTimer = null; }
 				DisposeBrushes();
 			}
 		}
+		#endregion
 
-		#region File Reading Logic
-		
-		private void ReadLatestGexData(object sender, EventArgs e)
+		#region Data Ingestion (Synchronous)
+		private void LoadGexDataFromCsv()
 		{
 			try
 			{
-				string todayStr = DateTime.Now.ToString("yyyy-MM-dd");
-				string fileName = string.Format("GEX_{0}_{1}.csv", GexTicker.Replace("^", ""), todayStr);
-				string fullPath = Path.Combine(dataDirectory, fileName);
-
-				if (!File.Exists(fullPath)) return;
-
-				if (currentLoadedDateStr != todayStr)
+				if (!Directory.Exists(CsvFolderPath))
 				{
-					lastFilePosition = 0;
-					currentLoadedDateStr = todayStr;
-					lock (dataLock)
-					{
-						historicalGexProfiles.Clear();
-						sortedTimestamps.Clear();
-					}
+					Print("GEX Engine Error: Directory not found -> " + CsvFolderPath);
+					return;
 				}
 
-				using (FileStream fs = new FileStream(fullPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-				{
-					if (fs.Length == lastFilePosition) return;
-					fs.Seek(lastFilePosition, SeekOrigin.Begin);
+				string targetName = !string.IsNullOrEmpty(TickerOverride) 
+					? TickerOverride.Replace("^", "").Replace(".", "_") 
+					: Instrument.MasterInstrument.Name.Replace("^", "").Replace(".", "_");
 
-					using (StreamReader reader = new StreamReader(fs))
+				string searchPattern = string.Format("*{0}*.csv", targetName);
+				string[] files = Directory.GetFiles(CsvFolderPath, searchPattern);
+
+				if (files.Length == 0)
+				{
+					Print(string.Format("GEX Engine: No files found for ticker '{0}'", targetName));
+					return;
+				}
+
+				Dictionary<DateTime, GexSnapshot> tempSnapshots = new Dictionary<DateTime, GexSnapshot>();
+				int loadedRows = 0;
+
+				foreach (string file in files)
+				{
+					using (StreamReader sr = new StreamReader(file))
 					{
 						string line;
-						bool newObjAdded = false;
-
-						while ((line = reader.ReadLine()) != null)
+						while ((line = sr.ReadLine()) != null)
 						{
 							if (string.IsNullOrWhiteSpace(line)) continue;
-							
-							string[] parts = line.Split(',');
-							if (parts.Length < 4) continue;
-							if (parts[0].Trim() == "Timestamp") continue;
 
-							try
+							string[] cols = line.Split(',');
+							if (cols[0].Contains("Time") || cols[0].Contains("Date") || cols[0].Contains("Timestamp")) continue;
+							if (cols.Length < 6) continue;
+
+							try 
 							{
-								DateTime timestamp = DateTime.ParseExact(parts[0].Trim(), "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture);
-								double spot = double.Parse(parts[1].Trim(), CultureInfo.InvariantCulture);
-								double strike = double.Parse(parts[2].Trim(), CultureInfo.InvariantCulture);
-								double gex = double.Parse(parts[3].Trim(), CultureInfo.InvariantCulture);
+								DateTime timestamp = DateTime.ParseExact(cols[0], "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture);
+								DateTime expiration = DateTime.ParseExact(cols[1], "yyyy-MM-dd", CultureInfo.InvariantCulture);
+								bool isCall = cols[2].Trim().Equals("Call", StringComparison.OrdinalIgnoreCase);
+								double strike = double.Parse(cols[3], CultureInfo.InvariantCulture);
+								int oi = (int)double.Parse(cols[4], CultureInfo.InvariantCulture);
+								double iv = double.Parse(cols[5], CultureInfo.InvariantCulture);
 
-								lock (dataLock)
+								if (!tempSnapshots.ContainsKey(timestamp))
+									tempSnapshots[timestamp] = new GexSnapshot { Timestamp = timestamp };
+
+								var snap = tempSnapshots[timestamp];
+								if (!snap.Strikes.ContainsKey(strike))
+									snap.Strikes[strike] = new List<OptionData>();
+
+								snap.Strikes[strike].Add(new OptionData
 								{
-									if (!historicalGexProfiles.ContainsKey(timestamp))
-									{
-										historicalGexProfiles[timestamp] = new GexSnapshot 
-										{ 
-											Timestamp = timestamp, 
-											SpotPrice = spot 
-										};
-										sortedTimestamps.Add(timestamp);
-										newObjAdded = true;
-									}
-
-									historicalGexProfiles[timestamp].Levels.Add(new GexLevel 
-									{ 
-										Strike = strike, 
-										GexBillions = gex 
-									});
-								}
+									Expiration = expiration,
+									IsCall = isCall,
+									Strike = strike,
+									OI = oi,
+									IV = iv
+								});
+								
+								loadedRows++;
 							}
-							catch { }
-						}
-						
-						lastFilePosition = fs.Position;
-
-						// Sort times so our binary search lookup works correctly
-						if (newObjAdded)
-						{
-							lock (dataLock)
-							{
-								sortedTimestamps.Sort();
-							}
-							// Force chart to redraw with new data
-							if (ChartControl != null) ChartControl.InvalidateVisual();
+							catch { } 
 						}
 					}
 				}
+
+				historicalSnapshots = tempSnapshots.Values.OrderBy(x => x.Timestamp).ToList();
+				isDataLoaded = historicalSnapshots.Count > 0;
+				
+				Print(string.Format("GEX Engine: Successfully loaded {0} rows across {1} time snapshots for {2}.", loadedRows, historicalSnapshots.Count, targetName));
 			}
-			catch { }
-		}
-		
-		#endregion
-
-		#region Time Synchronization Helper
-
-		// This finds the closest Python GEX snapshot that occurred BEFORE the current NinjaTrader bar
-		private GexSnapshot GetSnapshotForTime(DateTime chartTime)
-		{
-			lock (dataLock)
+			catch (Exception ex)
 			{
-				if (sortedTimestamps.Count == 0) return null;
-
-				// If chart time is older than our first record, return null
-				if (chartTime < sortedTimestamps[0]) return null;
-				
-				// If chart time is newer than our last record, return the most recent data
-				if (chartTime >= sortedTimestamps[sortedTimestamps.Count - 1])
-					return historicalGexProfiles[sortedTimestamps[sortedTimestamps.Count - 1]];
-
-				// Binary search to find the closest previous time
-				int index = sortedTimestamps.BinarySearch(chartTime);
-				if (index < 0)
-				{
-					// BinarySearch returns bitwise complement of the next larger element
-					index = ~index - 1; 
-				}
-				
-				if (index >= 0 && index < sortedTimestamps.Count)
-					return historicalGexProfiles[sortedTimestamps[index]];
-
-				return null;
+				Print("GEX Engine Loader Error: " + ex.Message);
 			}
 		}
-
 		#endregion
 
-		#region Rendering
+		#region Math Engine (Black-Scholes)
+		private static double NormPDF(double x)
+		{
+			return Math.Exp(-x * x / 2.0) / Math.Sqrt(2.0 * Math.PI);
+		}
+
+		private double CalculateGamma(double S, double K, double T, double v, double r = 0.05)
+		{
+			if (T <= 0 || v <= 0 || S <= 0 || K <= 0) return 0.0;
+			double d1 = (Math.Log(S / K) + (r + v * v / 2.0) * T) / (v * Math.Sqrt(T));
+			return NormPDF(d1) / (S * v * Math.Sqrt(T));
+		}
+		#endregion
+
+		#region Processing (Bar Update)
+		protected override void OnBarUpdate()
+		{
+			if (CurrentBar < 0 || !isDataLoaded) return;
+
+			GexSnapshot closestSnap = null;
+			DateTime currentBarTime = Time[0];
+
+			for (int i = historicalSnapshots.Count - 1; i >= 0; i--)
+			{
+				if (historicalSnapshots[i].Timestamp <= currentBarTime)
+				{
+					closestSnap = historicalSnapshots[i];
+					break;
+				}
+			}
+
+			if (closestSnap == null) return;
+
+			// Staleness Check
+			if ((currentBarTime - closestSnap.Timestamp).TotalMinutes > MaxDataAgeMinutes)
+				return;
+
+			double spotPrice = Close[0]; 
+			GexBarData barData = new GexBarData();
+
+			foreach (var kvp in closestSnap.Strikes)
+			{
+				double strike = kvp.Key;
+				double netGex = 0.0;
+				int totalOi = 0;
+
+				foreach (var opt in kvp.Value)
+				{
+					double T = Math.Max(0.001, (opt.Expiration - currentBarTime).TotalDays / 365.0);
+					double gamma = CalculateGamma(spotPrice, strike, T, opt.IV);
+					
+					double gex = gamma * opt.OI * 100.0;
+					
+					if (opt.IsCall) netGex += gex;
+					else netGex -= gex; 
+
+					totalOi += opt.OI;
+				}
+
+				barData.StrikeToNetGex[strike] = netGex;
+				barData.StrikeToTotalOI[strike] = totalOi;
+			}
+
+			gexSeries[0] = barData;
+		}
+		#endregion
+
+		#region Direct2D Rendering
+		private void DisposeBrushes()
+		{
+			if (positiveBrushes != null)
+			{
+				for (int i = 0; i < 256; i++)
+				{
+					if (positiveBrushes[i] != null) { positiveBrushes[i].Dispose(); positiveBrushes[i] = null; }
+					if (negativeBrushes[i] != null) { negativeBrushes[i].Dispose(); negativeBrushes[i] = null; }
+				}
+			}
+			if (tooltipBgBrush != null) { tooltipBgBrush.Dispose(); tooltipBgBrush = null; }
+			if (tooltipBorderBrush != null) { tooltipBorderBrush.Dispose(); tooltipBorderBrush = null; }
+			if (tooltipTextBrush != null) { tooltipTextBrush.Dispose(); tooltipTextBrush = null; }
+			if (tooltipTextFormat != null) { tooltipTextFormat.Dispose(); tooltipTextFormat = null; }
+		}
 
 		public override void OnRenderTargetChanged()
 		{
 			DisposeBrushes();
+
 			if (RenderTarget != null)
 			{
-				posGexBrush = new SharpDX.Direct2D1.SolidColorBrush(RenderTarget, SharpDX.Color.LimeGreen);
-				negGexBrush = new SharpDX.Direct2D1.SolidColorBrush(RenderTarget, SharpDX.Color.Red);
+				for (int i = 0; i < 256; i++)
+				{
+					double ratio = i / 255.0;
+					// Call Wall (Blue)
+					System.Windows.Media.Color posColor = InterpolateColor(System.Windows.Media.Color.FromRgb(10, 20, 40), System.Windows.Media.Color.FromRgb(0, 200, 255), ratio);
+					// Set Opacity to 0.6 to see candles clearly
+					positiveBrushes[i] = new SharpDX.Direct2D1.SolidColorBrush(RenderTarget, new SharpDX.Color(posColor.R, posColor.G, posColor.B)) { Opacity = 0.6f };
+					
+					// Put Wall (Red)
+					System.Windows.Media.Color negColor = InterpolateColor(System.Windows.Media.Color.FromRgb(40, 10, 10), System.Windows.Media.Color.FromRgb(255, 100, 0), ratio);
+					// Set Opacity to 0.6 to see candles clearly
+					negativeBrushes[i] = new SharpDX.Direct2D1.SolidColorBrush(RenderTarget, new SharpDX.Color(negColor.R, negColor.G, negColor.B)) { Opacity = 0.6f };
+				}
+
+				tooltipBgBrush = new SharpDX.Direct2D1.SolidColorBrush(RenderTarget, new SharpDX.Color4(0.1f, 0.1f, 0.15f, 0.95f));
+				tooltipBorderBrush = new SharpDX.Direct2D1.SolidColorBrush(RenderTarget, SharpDX.Color.Gray);
+				tooltipTextBrush = new SharpDX.Direct2D1.SolidColorBrush(RenderTarget, SharpDX.Color.White);
+				tooltipTextFormat = new SharpDX.DirectWrite.TextFormat(NinjaTrader.Core.Globals.DirectWriteFactory, "Consolas", 12) { ParagraphAlignment = ParagraphAlignment.Center };
 			}
 		}
 
-		private void DisposeBrushes()
+		private System.Windows.Media.Color InterpolateColor(System.Windows.Media.Color c1, System.Windows.Media.Color c2, double ratio)
 		{
-			if (posGexBrush != null) { posGexBrush.Dispose(); posGexBrush = null; }
-			if (negGexBrush != null) { negGexBrush.Dispose(); negGexBrush = null; }
+			byte r = (byte)(c1.R + (c2.R - c1.R) * ratio);
+			byte g = (byte)(c1.G + (c2.G - c1.G) * ratio);
+			byte b = (byte)(c1.B + (c2.B - c1.B) * ratio);
+			return System.Windows.Media.Color.FromRgb(r, g, b);
 		}
 
 		protected override void OnRender(ChartControl chartControl, ChartScale chartScale)
 		{
-			if (Bars == null || ChartBars == null || posGexBrush == null) return;
-
-			// 1. Calculate Maximum Absolute GEX in the visible range to scale opacities properly
-			double maxGexVisible = 0.1; // avoid divide by zero
+			if (Bars == null || !isDataLoaded || IsInHitTest || positiveBrushes == null || positiveBrushes[0] == null) return;
 			
-			lock (dataLock)
-			{
-				for (int i = ChartBars.FromIndex; i <= ChartBars.ToIndex; i++)
-				{
-					GexSnapshot snap = GetSnapshotForTime(Bars.GetTime(i));
-					if (snap == null) continue;
-
-					foreach(var level in snap.Levels)
-					{
-						// Only consider strikes currently visible on your Y-Axis to improve contrast
-						if (level.Strike >= chartScale.MinValue && level.Strike <= chartScale.MaxValue)
-						{
-							double absGex = Math.Abs(level.GexBillions);
-							if (absGex > maxGexVisible) maxGexVisible = absGex;
-						}
-					}
-				}
-			}
-
-			// 2. Draw the Heatmap Cells
-			float maxOpacity = GexOpacity / 100.0f;
-			
-			// We set Aliased mode so the blocks draw perfectly crisp without blurry edges
-			var oldMode = RenderTarget.AntialiasMode;
+			var previousMode = RenderTarget.AntialiasMode;
 			RenderTarget.AntialiasMode = SharpDX.Direct2D1.AntialiasMode.Aliased;
 
-			lock (dataLock)
+			double minPrice = chartScale.MinValue;
+			double maxPrice = chartScale.MaxValue;
+			double maxAbsGex = 0.0001; 
+
+			for (int i = ChartBars.FromIndex; i <= ChartBars.ToIndex; i++)
 			{
-				for (int i = ChartBars.FromIndex; i <= ChartBars.ToIndex; i++)
+				if (!gexSeries.IsValidDataPointAt(i)) continue;
+				GexBarData data = gexSeries.GetValueAt(i);
+				if (data == null) continue;
+				
+				foreach(var kvp in data.StrikeToNetGex)
 				{
-					GexSnapshot snap = GetSnapshotForTime(Bars.GetTime(i));
-					if (snap == null) continue;
-
-					// Calculate X coordinates for the bar width
-					float x1 = chartControl.GetXByBarIndex(ChartBars, i);
-					float x2 = chartControl.GetXByBarIndex(ChartBars, i + 1);
-					if (i == ChartBars.ToIndex) x2 = chartControl.CanvasRight;
-					
-					float width = x2 - x1 + 0.5f; // +0.5 to prevent vertical gap lines
-
-					if (width <= 0) continue;
-
-					// Draw each strike
-					foreach(var level in snap.Levels)
-					{
-						// Skip if off-screen
-						if (level.Strike > chartScale.MaxValue + TickSize || level.Strike < chartScale.MinValue - TickSize) 
-							continue;
-
-						// Calculate Opacity based on GEX magnitude
-						double ratio = Math.Abs(level.GexBillions) / maxGexVisible;
-						float cellOpacity = (float)(ratio * maxOpacity);
-						
-						// Filter out noise: Don't draw if it's too weak
-						if (cellOpacity < 0.05f) continue;
-
-						// Determine Y coordinates (center on the strike price)
-						// Standard SPX options are spaced by 5 pts. We can use a fixed height or TickSize.
-						// We'll use 1 point height to start.
-						float topY = chartScale.GetYByValue(level.Strike + 0.5); 
-						float bottomY = chartScale.GetYByValue(level.Strike - 0.5);
-						
-						float height = bottomY - topY + 0.5f;
-
-						SharpDX.RectangleF rect = new SharpDX.RectangleF(x1, topY, width, height);
-
-						// Draw Positive or Negative
-						if (level.GexBillions > 0)
-						{
-							posGexBrush.Opacity = cellOpacity;
-							RenderTarget.FillRectangle(rect, posGexBrush);
-						}
-						else if (level.GexBillions < 0)
-						{
-							negGexBrush.Opacity = cellOpacity;
-							RenderTarget.FillRectangle(rect, negGexBrush);
-						}
-					}
+					if (kvp.Key >= minPrice && kvp.Key <= maxPrice)
+						maxAbsGex = Math.Max(maxAbsGex, Math.Abs(kvp.Value));
 				}
 			}
-			
-			RenderTarget.AntialiasMode = oldMode;
-		}
 
+			List<GexHitInfo> frameHitList = new List<GexHitInfo>();
+
+			for (int i = ChartBars.FromIndex; i <= ChartBars.ToIndex; i++)
+			{
+				if (!gexSeries.IsValidDataPointAt(i)) continue;
+				GexBarData data = gexSeries.GetValueAt(i);
+				if (data == null) continue;
+
+				float x1 = chartControl.GetXByBarIndex(ChartBars, i);
+				float x2 = chartControl.GetXByBarIndex(ChartBars, i + 1);
+				if (i == ChartBars.ToIndex) x2 = chartControl.CanvasRight;
+				
+				float width = Math.Max(1f, x2 - x1);
+
+				foreach (var kvp in data.StrikeToNetGex)
+				{
+					double strike = kvp.Key;
+					double netGex = kvp.Value;
+
+					if (strike > maxPrice + StrikeInterval || strike < minPrice - StrikeInterval) continue;
+
+					double gexRatio = Math.Abs(netGex) / maxAbsGex;
+					if (gexRatio < (CutoffPercent / 100.0)) continue; 
+
+					float yCenter = chartScale.GetYByValue(strike);
+					float yTop = chartScale.GetYByValue(strike + (StrikeInterval / 2.0));
+					float yBottom = chartScale.GetYByValue(strike - (StrikeInterval / 2.0));
+					
+					float height = Math.Abs(yBottom - yTop);
+					float yDraw = Math.Min(yTop, yBottom);
+
+					SharpDX.RectangleF rect = new SharpDX.RectangleF(x1, yDraw, width, height);
+
+					int brushIndex = Math.Max(0, Math.Min(255, (int)(gexRatio * 255)));
+					var brush = netGex >= 0 ? positiveBrushes[brushIndex] : negativeBrushes[brushIndex];
+
+					RenderTarget.FillRectangle(rect, brush);
+
+					frameHitList.Add(new GexHitInfo 
+					{ 
+						Bounds = rect, 
+						Strike = strike, 
+						NetGex = netGex, 
+						TotalOI = data.StrikeToTotalOI[strike] 
+					});
+				}
+			}
+
+			RenderTarget.AntialiasMode = previousMode;
+			hitTestList = frameHitList;
+
+			if (showTooltip && hoveredCell != null) DrawTooltip(hoveredCell);
+		}
 		#endregion
 
-		#region Properties
-		
-		[NinjaScriptProperty]
-		[Display(Name="GEX Ticker", Description="Ticker symbol matching Python script (e.g., SPX, QQQ)", Order=1, GroupName="Parameters")]
-		public string GexTicker { get; set; }
+		#region Tooltips & Mouse Events
+		private void DrawTooltip(GexHitInfo info)
+		{
+			if (tooltipTextFormat == null || tooltipBgBrush == null) return;
+			
+			string gexFormatted = (info.NetGex / 1000000.0).ToString("0.00") + "M"; 
+			string text = string.Format("Strike: {0}\nNet GEX: {1}\nTotal OI: {2:N0}", info.Strike, gexFormatted, info.TotalOI);
 
-		[NinjaScriptProperty]
-		[Range(1, 60)]
-		[Display(Name="Refresh Seconds", Description="How often to check for new CSV data", Order=2, GroupName="Parameters")]
-		public int RefreshSeconds { get; set; }
+			using (var layout = new SharpDX.DirectWrite.TextLayout(NinjaTrader.Core.Globals.DirectWriteFactory, text, tooltipTextFormat, 250, 100))
+			{
+				float padding = 8f;
+				float width = layout.Metrics.Width + (padding * 2);
+				float height = layout.Metrics.Height + (padding * 2);
 
-		[NinjaScriptProperty]
-		[Range(1, 100)]
-		[Display(Name="Max Opacity", Description="Opacity for the largest GEX levels", Order=3, GroupName="Parameters")]
-		public int GexOpacity { get; set; }
-		
+				float tipX = mousePosition.X + 15;
+				float tipY = mousePosition.Y - height - 15;
+
+				if (tipX + width > ChartControl.ActualWidth) tipX = mousePosition.X - width - 15;
+				if (tipY < 0) tipY = mousePosition.Y + 15;
+
+				SharpDX.RectangleF rect = new SharpDX.RectangleF(tipX, tipY, width, height);
+				SharpDX.Direct2D1.RoundedRectangle roundedRect = new SharpDX.Direct2D1.RoundedRectangle { Rect = rect, RadiusX = 5, RadiusY = 5 };
+
+				RenderTarget.FillRoundedRectangle(roundedRect, tooltipBgBrush);
+				RenderTarget.DrawRoundedRectangle(roundedRect, tooltipBorderBrush, 1.5f);
+				RenderTarget.DrawTextLayout(new SharpDX.Vector2(tipX + padding, tipY + padding), layout, tooltipTextBrush);
+			}
+		}
+
+		private void OnChartMouseMove(object sender, MouseEventArgs e)
+		{
+			if (hoverTimer == null)
+			{
+				hoverTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(200) };
+				hoverTimer.Tick += (s, args) =>
+				{
+					hoverTimer.Stop();
+					showTooltip = true;
+					if (ChartControl != null) ChartControl.InvalidateVisual();
+				};
+			}
+
+			if (ChartControl == null) return;
+			System.Windows.Point wpfPoint = e.GetPosition(ChartControl as System.Windows.IInputElement);
+			mousePosition = new SharpDX.Vector2((float)wpfPoint.X, (float)wpfPoint.Y);
+
+			GexHitInfo found = hitTestList.LastOrDefault(hit => hit.Bounds.Contains(mousePosition));
+
+			if (found != null)
+			{
+				if (hoveredCell != found)
+				{
+					hoveredCell = found;
+					showTooltip = false;
+					hoverTimer.Stop();
+					hoverTimer.Start();
+				}
+			}
+			else if (hoveredCell != null)
+			{
+				hoveredCell = null;
+				showTooltip = false;
+				hoverTimer.Stop();
+				ChartControl.InvalidateVisual();
+			}
+		}
 		#endregion
 	}
 }
