@@ -75,6 +75,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		private SharpDX.Direct2D1.SolidColorBrush tooltipTextBrush;
         
 		private bool isMultiplierCalculated = false;
+		private double priceMultiplier = 1.0; // Private calculation variable
 		#endregion
 
 		#region Parameters
@@ -100,15 +101,6 @@ namespace NinjaTrader.NinjaScript.Indicators
 		[Range(1, 120)]
 		[Display(Name="Max Data Age (Min)", Description="Stop plotting if CSV data is older than this (prevents stretching).", Order=5, GroupName="Parameters")]
 		public int MaxDataAgeMinutes { get; set; }
-
-		[NinjaScriptProperty]
-		[Display(Name="Auto Multiplier", Description="Automatically calculate Price Multiplier based on chart price vs options strikes.", Order=6, GroupName="Parameters")]
-		public bool AutoMultiplier { get; set; }
-
-		[NinjaScriptProperty]
-		[Range(0.01, 1000.0)]
-		[Display(Name="Price Multiplier (Manual)", Description="Multiply CSV strikes by this to match chart. Ignored if Auto Multiplier is true.", Order=7, GroupName="Parameters")]
-		public double PriceMultiplier { get; set; }
 		#endregion
 
 		#region State Management
@@ -130,8 +122,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 				StrikeInterval								= 5.0; 
 				CutoffPercent								= 2.0; 
 				MaxDataAgeMinutes							= 5;
-				AutoMultiplier                              = true;
-				PriceMultiplier                             = 1.0; 
+				priceMultiplier                             = 1.0; 
 			}
 			else if (State == State.Configure)
 			{
@@ -292,7 +283,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 			double spotPrice = Close[0]; 
 
 			// --- AUTO MULTIPLIER LOGIC ---
-			if (AutoMultiplier && !isMultiplierCalculated && closestSnap.Strikes.Count > 0)
+			if (!isMultiplierCalculated && closestSnap.Strikes.Count > 0)
 			{
 				double sumStrikes = 0;
 				foreach (double strike in closestSnap.Strikes.Keys)
@@ -306,17 +297,17 @@ namespace NinjaTrader.NinjaScript.Indicators
 					double ratio = spotPrice / avgStrike;
 					if (ratio >= 1.0)
 					{
-						PriceMultiplier = Math.Round(ratio);
+						priceMultiplier = Math.Round(ratio);
 					}
 					else 
 					{
-						PriceMultiplier = Math.Round(ratio, 2); 
+						priceMultiplier = Math.Round(ratio, 2); 
 					}
 
 					// Fallback safety
-					if (PriceMultiplier <= 0) PriceMultiplier = 1;
+					if (priceMultiplier <= 0) priceMultiplier = 1;
 
-					Print(string.Format("GEX Engine: Auto-calculated Multiplier = {0} (Chart: {1:F2}, Avg Options Strike: {2:F2})", PriceMultiplier, spotPrice, avgStrike));
+					Print(string.Format("GEX Engine: Auto-calculated Multiplier = {0} (Chart: {1:F2}, Avg Options Strike: {2:F2})", priceMultiplier, spotPrice, avgStrike));
 				}
 				isMultiplierCalculated = true;
 			}
@@ -327,7 +318,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 			foreach (var kvp in closestSnap.Strikes)
 			{
 				double rawStrike = kvp.Key;
-				double adjustedStrike = rawStrike * PriceMultiplier; // APPLY MULTIPLIER
+				double adjustedStrike = rawStrike * priceMultiplier; // APPLY MULTIPLIER
 
 				double netGex = 0.0;
 				int totalOi = 0;
