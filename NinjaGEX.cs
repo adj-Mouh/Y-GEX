@@ -73,6 +73,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 		private SharpDX.Direct2D1.SolidColorBrush tooltipBgBrush;
 		private SharpDX.Direct2D1.SolidColorBrush tooltipBorderBrush;
 		private SharpDX.Direct2D1.SolidColorBrush tooltipTextBrush;
+        
+		private bool isMultiplierCalculated = false;
 		#endregion
 
 		#region Parameters
@@ -98,6 +100,15 @@ namespace NinjaTrader.NinjaScript.Indicators
 		[Range(1, 120)]
 		[Display(Name="Max Data Age (Min)", Description="Stop plotting if CSV data is older than this (prevents stretching).", Order=5, GroupName="Parameters")]
 		public int MaxDataAgeMinutes { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name="Auto Multiplier", Description="Automatically calculate Price Multiplier based on chart price vs options strikes.", Order=6, GroupName="Parameters")]
+		public bool AutoMultiplier { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(0.01, 1000.0)]
+		[Display(Name="Price Multiplier (Manual)", Description="Multiply CSV strikes by this to match chart. Ignored if Auto Multiplier is true.", Order=7, GroupName="Parameters")]
+		public double PriceMultiplier { get; set; }
 		#endregion
 
 		#region State Management
@@ -118,12 +129,13 @@ namespace NinjaTrader.NinjaScript.Indicators
 				TickerOverride                              = ""; 
 				StrikeInterval								= 5.0; 
 				CutoffPercent								= 2.0; 
-				MaxDataAgeMinutes							= 5; 
+				MaxDataAgeMinutes							= 5;
+				AutoMultiplier                              = true;
+				PriceMultiplier                             = 1.0; 
 			}
 			else if (State == State.Configure)
 			{
-				// NEW: Force the ZOrder to be -1, effectively placing it behind the candles
-				ZOrder = -1;
+				ZOrder = -1; // Draw behind candles
 			}
 			else if (State == State.DataLoaded)
 			{
@@ -131,6 +143,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 				gexSeries = new Series<GexBarData>(this, MaximumBarsLookBack.Infinite);
 				positiveBrushes = new SharpDX.Direct2D1.SolidColorBrush[256];
 				negativeBrushes = new SharpDX.Direct2D1.SolidColorBrush[256];
+				isMultiplierCalculated = false;
 
 				LoadGexDataFromCsv();
 			}
@@ -277,18 +290,54 @@ namespace NinjaTrader.NinjaScript.Indicators
 				return;
 
 			double spotPrice = Close[0]; 
+
+			// --- AUTO MULTIPLIER LOGIC ---
+			if (AutoMultiplier && !isMultiplierCalculated && closestSnap.Strikes.Count > 0)
+			{
+				double sumStrikes = 0;
+				foreach (double strike in closestSnap.Strikes.Keys)
+				{
+					sumStrikes += strike;
+				}
+				double avgStrike = sumStrikes / closestSnap.Strikes.Count;
+
+				if (avgStrike > 0)
+				{
+					double ratio = spotPrice / avgStrike;
+					if (ratio >= 1.0)
+					{
+						PriceMultiplier = Math.Round(ratio);
+					}
+					else 
+					{
+						PriceMultiplier = Math.Round(ratio, 2); 
+					}
+
+					// Fallback safety
+					if (PriceMultiplier <= 0) PriceMultiplier = 1;
+
+					Print(string.Format("GEX Engine: Auto-calculated Multiplier = {0} (Chart: {1:F2}, Avg Options Strike: {2:F2})", PriceMultiplier, spotPrice, avgStrike));
+				}
+				isMultiplierCalculated = true;
+			}
+			// -----------------------------
+
 			GexBarData barData = new GexBarData();
 
 			foreach (var kvp in closestSnap.Strikes)
 			{
-				double strike = kvp.Key;
+				double rawStrike = kvp.Key;
+				double adjustedStrike = rawStrike * PriceMultiplier; // APPLY MULTIPLIER
+
 				double netGex = 0.0;
 				int totalOi = 0;
 
 				foreach (var opt in kvp.Value)
 				{
 					double T = Math.Max(0.001, (opt.Expiration - currentBarTime).TotalDays / 365.0);
-					double gamma = CalculateGamma(spotPrice, strike, T, opt.IV);
+					
+					// Use Spot Price (S) and Adjusted Strike (K) for Gamma Calculation
+					double gamma = CalculateGamma(spotPrice, adjustedStrike, T, opt.IV);
 					
 					double gex = gamma * opt.OI * 100.0;
 					
@@ -298,8 +347,17 @@ namespace NinjaTrader.NinjaScript.Indicators
 					totalOi += opt.OI;
 				}
 
-				barData.StrikeToNetGex[strike] = netGex;
-				barData.StrikeToTotalOI[strike] = totalOi;
+				// Store data mapped to the ADJUSTED strike so it plots correctly on chart
+				if (barData.StrikeToNetGex.ContainsKey(adjustedStrike))
+				{
+					barData.StrikeToNetGex[adjustedStrike] += netGex;
+					barData.StrikeToTotalOI[adjustedStrike] += totalOi;
+				}
+				else
+				{
+					barData.StrikeToNetGex[adjustedStrike] = netGex;
+					barData.StrikeToTotalOI[adjustedStrike] = totalOi;
+				}
 			}
 
 			gexSeries[0] = barData;
@@ -332,14 +390,10 @@ namespace NinjaTrader.NinjaScript.Indicators
 				for (int i = 0; i < 256; i++)
 				{
 					double ratio = i / 255.0;
-					// Call Wall (Blue)
 					System.Windows.Media.Color posColor = InterpolateColor(System.Windows.Media.Color.FromRgb(10, 20, 40), System.Windows.Media.Color.FromRgb(0, 200, 255), ratio);
-					// Set Opacity to 0.6 to see candles clearly
 					positiveBrushes[i] = new SharpDX.Direct2D1.SolidColorBrush(RenderTarget, new SharpDX.Color(posColor.R, posColor.G, posColor.B)) { Opacity = 0.6f };
 					
-					// Put Wall (Red)
 					System.Windows.Media.Color negColor = InterpolateColor(System.Windows.Media.Color.FromRgb(40, 10, 10), System.Windows.Media.Color.FromRgb(255, 100, 0), ratio);
-					// Set Opacity to 0.6 to see candles clearly
 					negativeBrushes[i] = new SharpDX.Direct2D1.SolidColorBrush(RenderTarget, new SharpDX.Color(negColor.R, negColor.G, negColor.B)) { Opacity = 0.6f };
 				}
 
