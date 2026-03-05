@@ -41,6 +41,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 		public class GexBarData
 		{
+			public DateTime SnapshotTime; // Tracks the exact age of the snapshot
 			public Dictionary<double, double> StrikeToNetGex = new Dictionary<double, double>();
 			public Dictionary<double, int> StrikeToTotalOI = new Dictionary<double, int>();
 		}
@@ -64,7 +65,12 @@ namespace NinjaTrader.NinjaScript.Indicators
 		
 		private List<GexHitInfo> hitTestList = new List<GexHitInfo>();
 		private GexHitInfo hoveredCell = null;
+		
+		// Timers
 		private DispatcherTimer hoverTimer;
+		private DispatcherTimer fileCheckTimer;
+		private DateTime lastFileReadTime = DateTime.MinValue;
+
 		private bool showTooltip = false;
 		private bool isMouseSubscribed = false;
 		private SharpDX.Vector2 mousePosition;
@@ -76,7 +82,7 @@ namespace NinjaTrader.NinjaScript.Indicators
         
 		private bool isAutoCalculated = false;
 		private double priceMultiplier = 1.0; 
-		private double strikeInterval = 5.0; // Private calculation variable
+		private double strikeInterval = 5.0; 
 		#endregion
 
 		#region Parameters
@@ -104,9 +110,9 @@ namespace NinjaTrader.NinjaScript.Indicators
 		{
 			if (State == State.SetDefaults)
 			{
-				Description									= @"Visualizes Gamma Exposure (GEX) dynamically.";
+				Description									= @"Visualizes Gamma Exposure (GEX) dynamically in real-time.";
 				Name										= "GEX Heatmap Engine";
-				Calculate									= Calculate.OnBarClose;
+				Calculate									= Calculate.OnPriceChange; // Changed for real-time live bar populating
 				IsOverlay									= true;
 				DisplayInDataBox							= false;
 				DrawOnPricePanel							= true;
@@ -133,7 +139,17 @@ namespace NinjaTrader.NinjaScript.Indicators
 				negativeBrushes = new SharpDX.Direct2D1.SolidColorBrush[256];
 				isAutoCalculated = false;
 
+				// Initial Load
 				LoadGexDataFromCsv();
+
+				// Setup Auto-Reload Timer (every 5 seconds)
+				if (fileCheckTimer == null)
+				{
+					fileCheckTimer = new DispatcherTimer();
+					fileCheckTimer.Interval = TimeSpan.FromSeconds(5);
+					fileCheckTimer.Tick += OnFileCheckTimerTick;
+					fileCheckTimer.Start();
+				}
 			}
 			else if (State == State.Historical)
 			{
@@ -151,21 +167,18 @@ namespace NinjaTrader.NinjaScript.Indicators
 					isMouseSubscribed = false;
 				}
 				if (hoverTimer != null) { hoverTimer.Stop(); hoverTimer = null; }
+				if (fileCheckTimer != null) { fileCheckTimer.Stop(); fileCheckTimer = null; }
 				DisposeBrushes();
 			}
 		}
 		#endregion
 
-		#region Data Ingestion (Synchronous)
-		private void LoadGexDataFromCsv()
+		#region Real-Time File Monitoring
+		private void OnFileCheckTimerTick(object sender, EventArgs e)
 		{
 			try
 			{
-				if (!Directory.Exists(CsvFolderPath))
-				{
-					Print("GEX Engine Error: Directory not found -> " + CsvFolderPath);
-					return;
-				}
+				if (!Directory.Exists(CsvFolderPath)) return;
 
 				string targetName = !string.IsNullOrEmpty(TickerOverride) 
 					? TickerOverride.Replace("^", "").Replace(".", "_") 
@@ -174,26 +187,68 @@ namespace NinjaTrader.NinjaScript.Indicators
 				string searchPattern = string.Format("*{0}*.csv", targetName);
 				string[] files = Directory.GetFiles(CsvFolderPath, searchPattern);
 
-				if (files.Length == 0)
-				{
-					Print(string.Format("GEX Engine: No files found for ticker '{0}'", targetName));
-					return;
-				}
-
-				Dictionary<DateTime, GexSnapshot> tempSnapshots = new Dictionary<DateTime, GexSnapshot>();
-				int loadedRows = 0;
+				bool hasNewData = false;
+				DateTime latestWriteTime = lastFileReadTime;
 
 				foreach (string file in files)
 				{
-					using (StreamReader sr = new StreamReader(file))
+					DateTime fileWriteTime = File.GetLastWriteTime(file);
+					if (fileWriteTime > lastFileReadTime)
+					{
+						hasNewData = true;
+						if (fileWriteTime > latestWriteTime) latestWriteTime = fileWriteTime;
+					}
+				}
+
+				if (hasNewData)
+				{
+					LoadGexDataFromCsv(); // Silently reload in the background
+					lastFileReadTime = latestWriteTime;
+					
+					// Force the chart to redraw to show the new data immediately
+					if (ChartControl != null) ChartControl.InvalidateVisual();
+				}
+			}
+			catch (Exception ex)
+			{
+				Print("GEX Timer Auto-Reload Error: " + ex.Message);
+			}
+		}
+		#endregion
+
+		#region Data Ingestion
+		private void LoadGexDataFromCsv()
+		{
+			try
+			{
+				if (!Directory.Exists(CsvFolderPath)) return;
+
+				string targetName = !string.IsNullOrEmpty(TickerOverride) 
+					? TickerOverride.Replace("^", "").Replace(".", "_") 
+					: Instrument.MasterInstrument.Name.Replace("^", "").Replace(".", "_");
+
+				string searchPattern = string.Format("*{0}*.csv", targetName);
+				string[] files = Directory.GetFiles(CsvFolderPath, searchPattern);
+
+				if (files.Length == 0) return;
+
+				Dictionary<DateTime, GexSnapshot> tempSnapshots = new Dictionary<DateTime, GexSnapshot>();
+				DateTime maxWriteTime = lastFileReadTime;
+
+				foreach (string file in files)
+				{
+					// Track the newest file time
+					DateTime fileWriteTime = File.GetLastWriteTime(file);
+					if (fileWriteTime > maxWriteTime) maxWriteTime = fileWriteTime;
+
+					using (FileStream fs = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+					using (StreamReader sr = new StreamReader(fs))
 					{
 						string line;
 						while ((line = sr.ReadLine()) != null)
 						{
-							if (string.IsNullOrWhiteSpace(line)) continue;
-
+							if (string.IsNullOrWhiteSpace(line) || line.Contains("Timestamp")) continue;
 							string[] cols = line.Split(',');
-							if (cols[0].Contains("Time") || cols[0].Contains("Date") || cols[0].Contains("Timestamp")) continue;
 							if (cols.Length < 6) continue;
 
 							try 
@@ -209,19 +264,9 @@ namespace NinjaTrader.NinjaScript.Indicators
 									tempSnapshots[timestamp] = new GexSnapshot { Timestamp = timestamp };
 
 								var snap = tempSnapshots[timestamp];
-								if (!snap.Strikes.ContainsKey(strike))
-									snap.Strikes[strike] = new List<OptionData>();
+								if (!snap.Strikes.ContainsKey(strike)) snap.Strikes[strike] = new List<OptionData>();
 
-								snap.Strikes[strike].Add(new OptionData
-								{
-									Expiration = expiration,
-									IsCall = isCall,
-									Strike = strike,
-									OI = oi,
-									IV = iv
-								});
-								
-								loadedRows++;
+								snap.Strikes[strike].Add(new OptionData { Expiration = expiration, IsCall = isCall, Strike = strike, OI = oi, IV = iv });
 							}
 							catch { } 
 						}
@@ -230,21 +275,42 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 				historicalSnapshots = tempSnapshots.Values.OrderBy(x => x.Timestamp).ToList();
 				isDataLoaded = historicalSnapshots.Count > 0;
-				
-				Print(string.Format("GEX Engine: Successfully loaded {0} rows across {1} time snapshots for {2}.", loadedRows, historicalSnapshots.Count, targetName));
+				lastFileReadTime = maxWriteTime;
 			}
-			catch (Exception ex)
-			{
-				Print("GEX Engine Loader Error: " + ex.Message);
-			}
+			catch (Exception ex) { Print("GEX Loader Error: " + ex.Message); }
 		}
 		#endregion
 
-		#region Math Engine (Black-Scholes)
-		private static double NormPDF(double x)
+		#region Binary Search Timestamp Logic
+		private GexSnapshot GetClosestSnapshot(DateTime targetTime)
 		{
-			return Math.Exp(-x * x / 2.0) / Math.Sqrt(2.0 * Math.PI);
+			if (historicalSnapshots == null || historicalSnapshots.Count == 0) return null;
+
+			int left = 0;
+			int right = historicalSnapshots.Count - 1;
+			GexSnapshot closest = null;
+
+			while (left <= right)
+			{
+				int mid = left + (right - left) / 2;
+				
+				if (historicalSnapshots[mid].Timestamp <= targetTime)
+				{
+					closest = historicalSnapshots[mid]; 
+					left = mid + 1;
+				}
+				else
+				{
+					right = mid - 1; 
+				}
+			}
+
+			return closest;
 		}
+		#endregion
+
+		#region Math Engine
+		private static double NormPDF(double x) { return Math.Exp(-x * x / 2.0) / Math.Sqrt(2.0 * Math.PI); }
 
 		private double CalculateGamma(double S, double K, double T, double v, double r = 0.05)
 		{
@@ -259,35 +325,20 @@ namespace NinjaTrader.NinjaScript.Indicators
 		{
 			if (CurrentBar < 0 || !isDataLoaded) return;
 
-			GexSnapshot closestSnap = null;
 			DateTime currentBarTime = Time[0];
-
-			for (int i = historicalSnapshots.Count - 1; i >= 0; i--)
-			{
-				if (historicalSnapshots[i].Timestamp <= currentBarTime)
-				{
-					closestSnap = historicalSnapshots[i];
-					break;
-				}
-			}
-
+			
+			GexSnapshot closestSnap = GetClosestSnapshot(currentBarTime);
 			if (closestSnap == null) return;
 
-			// Staleness Check
-			if ((currentBarTime - closestSnap.Timestamp).TotalMinutes > MaxDataAgeMinutes)
-				return;
+			// Staleness check
+			if ((currentBarTime - closestSnap.Timestamp).TotalMinutes > MaxDataAgeMinutes) return;
 
 			double spotPrice = Close[0]; 
 
-			// --- AUTO CALCULATIONS (Multiplier & Interval) ---
+			// --- AUTO CALCULATIONS ---
 			if (!isAutoCalculated && closestSnap.Strikes.Count > 1)
 			{
-				// 1. Calculate Multiplier
-				double sumStrikes = 0;
-				foreach (double s in closestSnap.Strikes.Keys)
-				{
-					sumStrikes += s;
-				}
+				double sumStrikes = closestSnap.Strikes.Keys.Sum();
 				double avgStrike = sumStrikes / closestSnap.Strikes.Count;
 
 				if (avgStrike > 0)
@@ -297,46 +348,32 @@ namespace NinjaTrader.NinjaScript.Indicators
 					if (priceMultiplier <= 0) priceMultiplier = 1;
 				}
 
-				// 2. Calculate Strike Interval
 				var sortedStrikes = closestSnap.Strikes.Keys.OrderBy(k => k).ToList();
 				double minDiff = double.MaxValue;
-				
 				for (int i = 1; i < sortedStrikes.Count; i++)
 				{
 					double diff = Math.Round(sortedStrikes[i] - sortedStrikes[i - 1], 2);
-					if (diff > 0.1 && diff < minDiff) // Ensure we ignore fractional data anomalies
-					{
-						minDiff = diff;
-					}
+					if (diff > 0.1 && diff < minDiff) minDiff = diff;
 				}
+				if (minDiff != double.MaxValue) strikeInterval = minDiff * priceMultiplier;
 
-				if (minDiff != double.MaxValue)
-				{
-					strikeInterval = minDiff * priceMultiplier;
-				}
-
-				Print(string.Format("GEX Engine: Auto-calculated -> Multiplier = {0}, Strike Interval = {1}", priceMultiplier, strikeInterval));
 				isAutoCalculated = true;
 			}
-			// ------------------------------------------------
+			// -------------------------
 
 			GexBarData barData = new GexBarData();
+			barData.SnapshotTime = closestSnap.Timestamp; // Record the snapshot age here
 
 			foreach (var kvp in closestSnap.Strikes)
 			{
-				double rawStrike = kvp.Key;
-				double adjustedStrike = rawStrike * priceMultiplier; // APPLY MULTIPLIER
-
+				double adjustedStrike = kvp.Key * priceMultiplier;
 				double netGex = 0.0;
 				int totalOi = 0;
 
 				foreach (var opt in kvp.Value)
 				{
 					double T = Math.Max(0.001, (opt.Expiration - currentBarTime).TotalDays / 365.0);
-					
-					// Use Spot Price (S) and Adjusted Strike (K) for Gamma Calculation
 					double gamma = CalculateGamma(spotPrice, adjustedStrike, T, opt.IV);
-					
 					double gex = gamma * opt.OI * 100.0;
 					
 					if (opt.IsCall) netGex += gex;
@@ -345,7 +382,6 @@ namespace NinjaTrader.NinjaScript.Indicators
 					totalOi += opt.OI;
 				}
 
-				// Store data mapped to the ADJUSTED strike so it plots correctly on chart
 				if (barData.StrikeToNetGex.ContainsKey(adjustedStrike))
 				{
 					barData.StrikeToNetGex[adjustedStrike] += netGex;
@@ -362,7 +398,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		}
 		#endregion
 
-		#region Direct2D Rendering
+		#region Direct2D Rendering & Tooltips
 		private void DisposeBrushes()
 		{
 			if (positiveBrushes != null)
@@ -399,7 +435,6 @@ namespace NinjaTrader.NinjaScript.Indicators
 				tooltipBorderBrush = new SharpDX.Direct2D1.SolidColorBrush(RenderTarget, SharpDX.Color.Gray);
 				tooltipTextBrush = new SharpDX.Direct2D1.SolidColorBrush(RenderTarget, SharpDX.Color.White);
 				
-				// Fix: Ensure TextAlignment and ParagraphAlignment don't offset the text outside the bounds
 				tooltipTextFormat = new SharpDX.DirectWrite.TextFormat(NinjaTrader.Core.Globals.DirectWriteFactory, "Consolas", 12) 
 				{ 
 					TextAlignment = SharpDX.DirectWrite.TextAlignment.Leading, 
@@ -427,6 +462,18 @@ namespace NinjaTrader.NinjaScript.Indicators
 			double maxPrice = chartScale.MaxValue;
 			double maxAbsGex = 0.0001; 
 
+			// Find the absolute latest valid bar on screen to determine if we should project rays
+			int lastValidIndex = -1;
+			for (int i = ChartBars.ToIndex; i >= ChartBars.FromIndex; i--)
+			{
+				if (gexSeries.IsValidDataPointAt(i) && gexSeries.GetValueAt(i) != null)
+				{
+					lastValidIndex = i;
+					break;
+				}
+			}
+
+			// Calculate Max GEX for Relative Shading
 			for (int i = ChartBars.FromIndex; i <= ChartBars.ToIndex; i++)
 			{
 				if (!gexSeries.IsValidDataPointAt(i)) continue;
@@ -450,8 +497,18 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 				float x1 = chartControl.GetXByBarIndex(ChartBars, i);
 				float x2 = chartControl.GetXByBarIndex(ChartBars, i + 1);
-				if (i == ChartBars.ToIndex) x2 = chartControl.CanvasRight;
 				
+				// PROJECT RAYS TO THE RIGHT MARGIN LOGIC
+				if (i == lastValidIndex)
+				{
+					// Check if the data is fresh compared to the live edge of the screen
+					DateTime screenEndTime = Bars.GetTime(ChartBars.ToIndex);
+					if ((screenEndTime - data.SnapshotTime).TotalMinutes <= MaxDataAgeMinutes)
+					{
+						x2 = chartControl.CanvasRight; // Shoots horizontal rays across the right margin
+					}
+				}
+
 				float width = Math.Max(1f, x2 - x1);
 
 				foreach (var kvp in data.StrikeToNetGex)
@@ -464,7 +521,6 @@ namespace NinjaTrader.NinjaScript.Indicators
 					double gexRatio = Math.Abs(netGex) / maxAbsGex;
 					if (gexRatio < (CutoffPercent / 100.0)) continue; 
 
-					float yCenter = chartScale.GetYByValue(strike);
 					float yTop = chartScale.GetYByValue(strike + (strikeInterval / 2.0));
 					float yBottom = chartScale.GetYByValue(strike - (strikeInterval / 2.0));
 					
@@ -472,19 +528,12 @@ namespace NinjaTrader.NinjaScript.Indicators
 					float yDraw = Math.Min(yTop, yBottom);
 
 					SharpDX.RectangleF rect = new SharpDX.RectangleF(x1, yDraw, width, height);
-
 					int brushIndex = Math.Max(0, Math.Min(255, (int)(gexRatio * 255)));
 					var brush = netGex >= 0 ? positiveBrushes[brushIndex] : negativeBrushes[brushIndex];
 
 					RenderTarget.FillRectangle(rect, brush);
 
-					frameHitList.Add(new GexHitInfo 
-					{ 
-						Bounds = rect, 
-						Strike = strike, 
-						NetGex = netGex, 
-						TotalOI = data.StrikeToTotalOI[strike] 
-					});
+					frameHitList.Add(new GexHitInfo { Bounds = rect, Strike = strike, NetGex = netGex, TotalOI = data.StrikeToTotalOI[strike] });
 				}
 			}
 
@@ -493,14 +542,11 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 			if (showTooltip && hoveredCell != null) DrawTooltip(hoveredCell);
 		}
-		#endregion
 
-		#region Tooltips & Mouse Events
 		private void DrawTooltip(GexHitInfo info)
 		{
 			if (tooltipTextFormat == null || tooltipBgBrush == null) return;
 			
-			// Show ONLY Total OI now
 			string text = string.Format("Total OI: {0:N0}", info.TotalOI);
 
 			using (var layout = new SharpDX.DirectWrite.TextLayout(NinjaTrader.Core.Globals.DirectWriteFactory, text, tooltipTextFormat, 250, 100))
@@ -520,8 +566,6 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 				RenderTarget.FillRoundedRectangle(roundedRect, tooltipBgBrush);
 				RenderTarget.DrawRoundedRectangle(roundedRect, tooltipBorderBrush, 1.5f);
-				
-				// Draw text tightly within the padding offsets
 				RenderTarget.DrawTextLayout(new SharpDX.Vector2(tipX + padding, tipY + padding), layout, tooltipTextBrush);
 			}
 		}
