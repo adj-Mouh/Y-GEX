@@ -74,8 +74,9 @@ namespace NinjaTrader.NinjaScript.Indicators
 		private SharpDX.Direct2D1.SolidColorBrush tooltipBorderBrush;
 		private SharpDX.Direct2D1.SolidColorBrush tooltipTextBrush;
         
-		private bool isMultiplierCalculated = false;
-		private double priceMultiplier = 1.0; // Private calculation variable
+		private bool isAutoCalculated = false;
+		private double priceMultiplier = 1.0; 
+		private double strikeInterval = 5.0; // Private calculation variable
 		#endregion
 
 		#region Parameters
@@ -88,18 +89,13 @@ namespace NinjaTrader.NinjaScript.Indicators
 		public string TickerOverride { get; set; }
 
 		[NinjaScriptProperty]
-		[Range(0.1, 100)]
-		[Display(Name="Strike Interval", Description="Spacing between strikes (e.g. 5 for SPX, 1 for SPY). Used for drawing height.", Order=3, GroupName="Parameters")]
-		public double StrikeInterval { get; set; }
-
-		[NinjaScriptProperty]
 		[Range(0, 100)]
-		[Display(Name="Filter Cutoff %", Description="Hide cells with GEX lower than this percentage of the max.", Order=4, GroupName="Parameters")]
+		[Display(Name="Filter Cutoff %", Description="Hide cells with GEX lower than this percentage of the max.", Order=3, GroupName="Parameters")]
 		public double CutoffPercent { get; set; }
 
 		[NinjaScriptProperty]
 		[Range(1, 120)]
-		[Display(Name="Max Data Age (Min)", Description="Stop plotting if CSV data is older than this (prevents stretching).", Order=5, GroupName="Parameters")]
+		[Display(Name="Max Data Age (Min)", Description="Stop plotting if CSV data is older than this (prevents stretching).", Order=4, GroupName="Parameters")]
 		public int MaxDataAgeMinutes { get; set; }
 		#endregion
 
@@ -119,10 +115,11 @@ namespace NinjaTrader.NinjaScript.Indicators
 				
 				CsvFolderPath								= @"C:\Options_History_Data";
 				TickerOverride                              = ""; 
-				StrikeInterval								= 5.0; 
 				CutoffPercent								= 2.0; 
 				MaxDataAgeMinutes							= 5;
+				
 				priceMultiplier                             = 1.0; 
+				strikeInterval                              = 5.0;
 			}
 			else if (State == State.Configure)
 			{
@@ -134,7 +131,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 				gexSeries = new Series<GexBarData>(this, MaximumBarsLookBack.Infinite);
 				positiveBrushes = new SharpDX.Direct2D1.SolidColorBrush[256];
 				negativeBrushes = new SharpDX.Direct2D1.SolidColorBrush[256];
-				isMultiplierCalculated = false;
+				isAutoCalculated = false;
 
 				LoadGexDataFromCsv();
 			}
@@ -282,36 +279,46 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 			double spotPrice = Close[0]; 
 
-			// --- AUTO MULTIPLIER LOGIC ---
-			if (!isMultiplierCalculated && closestSnap.Strikes.Count > 0)
+			// --- AUTO CALCULATIONS (Multiplier & Interval) ---
+			if (!isAutoCalculated && closestSnap.Strikes.Count > 1)
 			{
+				// 1. Calculate Multiplier
 				double sumStrikes = 0;
-				foreach (double strike in closestSnap.Strikes.Keys)
+				foreach (double s in closestSnap.Strikes.Keys)
 				{
-					sumStrikes += strike;
+					sumStrikes += s;
 				}
 				double avgStrike = sumStrikes / closestSnap.Strikes.Count;
 
 				if (avgStrike > 0)
 				{
 					double ratio = spotPrice / avgStrike;
-					if (ratio >= 1.0)
-					{
-						priceMultiplier = Math.Round(ratio);
-					}
-					else 
-					{
-						priceMultiplier = Math.Round(ratio, 2); 
-					}
-
-					// Fallback safety
+					priceMultiplier = ratio >= 1.0 ? Math.Round(ratio) : Math.Round(ratio, 2);
 					if (priceMultiplier <= 0) priceMultiplier = 1;
-
-					Print(string.Format("GEX Engine: Auto-calculated Multiplier = {0} (Chart: {1:F2}, Avg Options Strike: {2:F2})", priceMultiplier, spotPrice, avgStrike));
 				}
-				isMultiplierCalculated = true;
+
+				// 2. Calculate Strike Interval
+				var sortedStrikes = closestSnap.Strikes.Keys.OrderBy(k => k).ToList();
+				double minDiff = double.MaxValue;
+				
+				for (int i = 1; i < sortedStrikes.Count; i++)
+				{
+					double diff = Math.Round(sortedStrikes[i] - sortedStrikes[i - 1], 2);
+					if (diff > 0.1 && diff < minDiff) // Ensure we ignore fractional data anomalies
+					{
+						minDiff = diff;
+					}
+				}
+
+				if (minDiff != double.MaxValue)
+				{
+					strikeInterval = minDiff * priceMultiplier;
+				}
+
+				Print(string.Format("GEX Engine: Auto-calculated -> Multiplier = {0}, Strike Interval = {1}", priceMultiplier, strikeInterval));
+				isAutoCalculated = true;
 			}
-			// -----------------------------
+			// ------------------------------------------------
 
 			GexBarData barData = new GexBarData();
 
@@ -391,7 +398,13 @@ namespace NinjaTrader.NinjaScript.Indicators
 				tooltipBgBrush = new SharpDX.Direct2D1.SolidColorBrush(RenderTarget, new SharpDX.Color4(0.1f, 0.1f, 0.15f, 0.95f));
 				tooltipBorderBrush = new SharpDX.Direct2D1.SolidColorBrush(RenderTarget, SharpDX.Color.Gray);
 				tooltipTextBrush = new SharpDX.Direct2D1.SolidColorBrush(RenderTarget, SharpDX.Color.White);
-				tooltipTextFormat = new SharpDX.DirectWrite.TextFormat(NinjaTrader.Core.Globals.DirectWriteFactory, "Consolas", 12) { ParagraphAlignment = ParagraphAlignment.Center };
+				
+				// Fix: Ensure TextAlignment and ParagraphAlignment don't offset the text outside the bounds
+				tooltipTextFormat = new SharpDX.DirectWrite.TextFormat(NinjaTrader.Core.Globals.DirectWriteFactory, "Consolas", 12) 
+				{ 
+					TextAlignment = SharpDX.DirectWrite.TextAlignment.Leading, 
+					ParagraphAlignment = SharpDX.DirectWrite.ParagraphAlignment.Near 
+				};
 			}
 		}
 
@@ -446,14 +459,14 @@ namespace NinjaTrader.NinjaScript.Indicators
 					double strike = kvp.Key;
 					double netGex = kvp.Value;
 
-					if (strike > maxPrice + StrikeInterval || strike < minPrice - StrikeInterval) continue;
+					if (strike > maxPrice + strikeInterval || strike < minPrice - strikeInterval) continue;
 
 					double gexRatio = Math.Abs(netGex) / maxAbsGex;
 					if (gexRatio < (CutoffPercent / 100.0)) continue; 
 
 					float yCenter = chartScale.GetYByValue(strike);
-					float yTop = chartScale.GetYByValue(strike + (StrikeInterval / 2.0));
-					float yBottom = chartScale.GetYByValue(strike - (StrikeInterval / 2.0));
+					float yTop = chartScale.GetYByValue(strike + (strikeInterval / 2.0));
+					float yBottom = chartScale.GetYByValue(strike - (strikeInterval / 2.0));
 					
 					float height = Math.Abs(yBottom - yTop);
 					float yDraw = Math.Min(yTop, yBottom);
@@ -487,8 +500,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 		{
 			if (tooltipTextFormat == null || tooltipBgBrush == null) return;
 			
-			string gexFormatted = (info.NetGex / 1000000.0).ToString("0.00") + "M"; 
-			string text = string.Format("Strike: {0}\nNet GEX: {1}\nTotal OI: {2:N0}", info.Strike, gexFormatted, info.TotalOI);
+			// Show ONLY Total OI now
+			string text = string.Format("Total OI: {0:N0}", info.TotalOI);
 
 			using (var layout = new SharpDX.DirectWrite.TextLayout(NinjaTrader.Core.Globals.DirectWriteFactory, text, tooltipTextFormat, 250, 100))
 			{
@@ -507,6 +520,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 				RenderTarget.FillRoundedRectangle(roundedRect, tooltipBgBrush);
 				RenderTarget.DrawRoundedRectangle(roundedRect, tooltipBorderBrush, 1.5f);
+				
+				// Draw text tightly within the padding offsets
 				RenderTarget.DrawTextLayout(new SharpDX.Vector2(tipX + padding, tipY + padding), layout, tooltipTextBrush);
 			}
 		}
