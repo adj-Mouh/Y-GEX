@@ -26,7 +26,7 @@ CONFIG = {
     "INTERVAL_SECONDS": 60,        
     
     # Where to save the files
-    "OUTPUT_DIR": r"C:\Options_History_Data",
+    "OUTPUT_DIR": r"\Options_History_Data",
     
     # Filter strikes to save disk space
     "SPOT_PRICE_RANGE_PERCENT": 0.10, # +/- 10%
