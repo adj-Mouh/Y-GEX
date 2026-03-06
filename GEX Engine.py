@@ -1,128 +1,205 @@
 import yfinance as yf
 import pandas as pd
-import os
 import time
-from datetime import datetime
-import concurrent.futures
+import os
+import datetime
+import logging
 
-# --- 1. SETTINGS ---
-TICKERS = ["^SPX", "SPY", "QQQ", "IWM", "AAPL", "NVDA"] 
-EXPIRATIONS_TO_PULL = 4      
-INTERVAL_SECONDS = 60        
-OUTPUT_DIR = r"./Options_History_Data"   
-SPOT_PRICE_RANGE = 0.10      # Track strikes within +/- 10% of current price (Saves massive disk space)
-
-if not os.path.exists(OUTPUT_DIR):
-    os.makedirs(OUTPUT_DIR)
-
-# --- 2. WORKER FUNCTION ---
-def fetch_and_store(symbol, date_str, current_time):
-    timestamp_str = current_time.strftime("%Y-%m-%d %H:%M:%S")
-    clean_symbol = symbol.replace('^', '').replace('.', '_')
-    file_name = f"{clean_symbol}_Options_{date_str}.csv"
-    file_path = os.path.join(OUTPUT_DIR, file_name)
+# --- CONFIGURATION ---
+# Adjust all settings for the engine here.
+CONFIG = {
+    # Ticker for options (e.g., '^SPX', 'SPY', 'QQQ', 'IWM').
+    "ticker_symbol": "^SPX", 
     
+    # Path to save the CSV files for NinjaTrader to read.
+    "output_folder_path": r"C:\Options_History_Data",
+    
+    # How often to fetch new data from Yahoo Finance (in seconds). 900 = 15 minutes.
+    "fetch_interval_seconds": 900,
+    
+    # How many days into the future to look for option expirations.
+    "expiration_day_limit": 45,
+    
+    # Filter out strikes that are more than this % away from the spot price.
+    "strike_filter_percentage": 15.0,
+    
+    # How many hours of old CSV files to keep before deleting them.
+    "hours_to_keep_files": 24
+}
+# --- END OF CONFIGURATION ---
+
+# Setup professional logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+
+def fetch_data(ticker_obj, expiration_limit_days):
+    """
+    Fetches spot price and all relevant option chain data from yfinance.
+    
+    Args:
+        ticker_obj (yf.Ticker): The yfinance Ticker object.
+        expiration_limit_days (int): The number of days out to fetch expirations for.
+
+    Returns:
+        A tuple containing: (spot_price, list_of_option_dataframes) or (None, []) on failure.
+    """
     try:
-        tk_yf = yf.Ticker(symbol)
+        # 1. Get current spot price
+        history = ticker_obj.history(period='1d', interval='1m')
+        if history.empty:
+            logging.error("Could not fetch recent history to determine spot price.")
+            return None, []
+        spot_price = history['Close'].iloc[-1]
+
+        # 2. Get all expirations within the configured day limit
+        all_expirations = ticker_obj.options
+        today = datetime.datetime.now()
+        limit_date = today + datetime.timedelta(days=expiration_limit_days)
         
-        # 1. Fetch Spot Price to use for filtering
-        try:
-            spot_price = tk_yf.fast_info['lastPrice']
-        except:
-            try:
-                spot_price = tk_yf.history(period="1d", interval="1m")['Close'].iloc[-1]
-            except:
-                return symbol, 404, "Could not fetch spot price for filtering."
+        relevant_expirations = [
+            exp for exp in all_expirations 
+            if datetime.datetime.strptime(exp, '%Y-%m-%d') <= limit_date
+        ]
 
-        expirations = tk_yf.options
-        if not expirations:
-            return symbol, 404, "No options data found."
+        if not relevant_expirations:
+            logging.warning("No option expirations found within the configured date limit.")
+            return spot_price, []
 
-        all_options = []
-
-        # 2. Fetch Options Data
-        for exp in expirations[:EXPIRATIONS_TO_PULL]:
-            try:
-                opt = tk_yf.option_chain(exp)
-                calls, puts = opt.calls, opt.puts
-            except Exception as e:
-                if "403" in str(e) or "429" in str(e) or "Unauthorized" in str(e):
-                    return symbol, 403, f"BLOCKED BY YAHOO FINANCE: {e}"
-                continue
-
-            if not calls.empty:
-                calls = calls[['strike', 'openInterest', 'impliedVolatility']].copy()
-                calls['Type'] = 'Call'
-                calls['Expiration'] = exp
-                all_options.append(calls)
-
-            if not puts.empty:
-                puts = puts[['strike', 'openInterest', 'impliedVolatility']].copy()
-                puts['Type'] = 'Put'
-                puts['Expiration'] = exp
-                all_options.append(puts)
-
-        if not all_options:
-            return symbol, 204, "Data fetched but chains were empty."
-
-        # 3. Combine Data
-        df = pd.concat(all_options, ignore_index=True)
-        
-        # 4. FILTER BY SPOT PRICE RANGE (This shrinks the file size dramatically!)
-        min_strike = spot_price * (1 - SPOT_PRICE_RANGE)
-        max_strike = spot_price * (1 + SPOT_PRICE_RANGE)
-        df = df[(df['strike'] >= min_strike) & (df['strike'] <= max_strike)]
-        
-        # 5. Clean and Format
-        df['openInterest'] = df['openInterest'].fillna(0)
-        df['impliedVolatility'] = df['impliedVolatility'].fillna(0.0001)
-        df = df[df['openInterest'] > 0]
-        
-        df['Timestamp'] = timestamp_str
-        df = df[['Timestamp', 'Expiration', 'Type', 'strike', 'openInterest', 'impliedVolatility']]
-        df.rename(columns={'strike': 'Strike', 'openInterest': 'OI', 'impliedVolatility': 'IV'}, inplace=True)
-        
-        # 6. Save to CSV
-        file_exists = os.path.isfile(file_path)
-        df.to_csv(file_path, mode='a', header=not file_exists, index=False)
-        
-        return symbol, 200, f"Saved {len(df)} strikes (Filtered +/- {SPOT_PRICE_RANGE*100}% of Spot)."
+        # 3. Fetch Calls and Puts for each relevant expiration date
+        all_options_dfs = []
+        for exp in relevant_expirations:
+            opt_chain = ticker_obj.option_chain(exp)
+            
+            calls = opt_chain.calls
+            calls['Type'] = 'Call'
+            calls['Expiration'] = exp
+            
+            puts = opt_chain.puts
+            puts['Type'] = 'Put'
+            puts['Expiration'] = exp
+            
+            all_options_dfs.extend([calls, puts])
+            
+        logging.info(f"Successfully fetched {len(all_options_dfs)} option sets for {len(relevant_expirations)} expirations.")
+        return spot_price, all_options_dfs
 
     except Exception as e:
-        if "403" in str(e) or "429" in str(e):
-            return symbol, 429, f"RATE LIMITED/BLOCKED: {e}"
-        return symbol, 500, f"Internal Error: {e}"
+        logging.error(f"An error occurred during yfinance data fetch: {e}")
+        return None, []
 
-# --- 3. MAIN CONTROLLER LOOP ---
-def run_parallel_fetcher():
-    print(f"🚀 Starting Parallel Options Fetcher. Interval: {INTERVAL_SECONDS}s")
-    print(f"✂️  Filtering out strikes beyond +/- {SPOT_PRICE_RANGE*100}% of Spot Price.")
-    
-    while True:
-        loop_start_time = time.time()
-        current_time = datetime.now()
-        date_str = current_time.strftime("%Y-%m-%d")
+def process_and_save_data(dataframes, spot_price, config):
+    """
+    Cleans, formats, and saves the final data to a CSV file for NinjaTrader.
+    """
+    if not dataframes:
+        logging.warning("No dataframes to process.")
+        return
+
+    try:
+        # 1. Combine all data into a single DataFrame
+        full_df = pd.concat(dataframes, ignore_index=True)
+
+        # 2. Filter for relevant strikes based on the spot price
+        strike_filter = config["strike_filter_percentage"] / 100.0
+        min_strike = spot_price * (1 - strike_filter)
+        max_strike = spot_price * (1 + strike_filter)
+        full_df = full_df[(full_df['strike'] >= min_strike) & (full_df['strike'] <= max_strike)]
+
+        # 3. Clean the data for NinjaTrader
+        full_df['openInterest'] = full_df['openInterest'].fillna(0)
+        full_df['impliedVolatility'] = full_df['impliedVolatility'].fillna(0.0001)
         
-        print(f"\n[{current_time.strftime('%H:%M:%S')}] 📡 Fetching data for {len(TICKERS)} tickers in parallel...")
+        # 4. Add timestamps and the underlying spot price (for basis ratio calculation in C#)
+        timestamp_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        full_df['Timestamp'] = timestamp_str
+        full_df['UnderlyingSpot'] = round(spot_price, 2)
         
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(TICKERS)) as executor:
-            futures = [executor.submit(fetch_and_store, ticker, date_str, current_time) for ticker in TICKERS]
+        # 5. Select and rename columns to match C# expectations
+        final_df = full_df[[
+            'Timestamp', 
+            'Expiration', 
+            'UnderlyingSpot', 
+            'Type', 
+            'strike', 
+            'openInterest', 
+            'impliedVolatility'
+        ]]
+        final_df.rename(columns={
+            'strike': 'Strike', 
+            'openInterest': 'OI', 
+            'impliedVolatility': 'IV'
+        }, inplace=True)
+        
+        # 6. Save to CSV
+        output_folder = config["output_folder_path"]
+        safe_ticker_name = config["ticker_symbol"].replace('^', '').replace('.', '_')
+        file_name = f"{safe_ticker_name}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        
+        if not os.path.exists(output_folder):
+            os.makedirs(output_folder)
+            logging.info(f"Created output directory: {output_folder}")
             
-            for future in concurrent.futures.as_completed(futures):
-                symbol, status_code, message = future.result()
-                
-                if status_code == 200:
-                    print(f"  ✅ [200 OK] {symbol:<5} -> {message}")
-                elif status_code in [403, 429]:
-                    print(f"  🛑 [{status_code} BLOCKED] {symbol:<5} -> {message}")
-                else:
-                    print(f"  ⚠️ [{status_code} WARN] {symbol:<5} -> {message}")
+        output_path = os.path.join(output_folder, file_name)
+        final_df.to_csv(output_path, index=False)
+        logging.info(f"Successfully saved data to {output_path}")
 
-        execution_time = time.time() - loop_start_time
-        sleep_time = max(0, INTERVAL_SECONDS - execution_time)
+    except Exception as e:
+        logging.error(f"Failed to process and save data: {e}")
+
+def cleanup_files(config):
+    """
+    Deletes old CSV files from the output directory to save space.
+    """
+    try:
+        folder = config["output_folder_path"]
+        if not os.path.isdir(folder):
+            return
+
+        now = time.time()
+        age_limit_seconds = config["hours_to_keep_files"] * 3600
+        cleaned_count = 0
+
+        for filename in os.listdir(folder):
+            file_path = os.path.join(folder, filename)
+            if os.stat(file_path).st_mtime < now - age_limit_seconds:
+                os.remove(file_path)
+                cleaned_count += 1
         
-        print(f"⏱️ Cycle took {execution_time:.2f}s. Sleeping for {sleep_time:.2f}s...")
-        time.sleep(sleep_time)
+        if cleaned_count > 0:
+            logging.info(f"Cleaned up {cleaned_count} old data files.")
+            
+    except Exception as e:
+        logging.error(f"Error during file cleanup: {e}")
+
+
+def main():
+    """
+    Main loop to run the GEX data engine.
+    """
+    logging.info(f"GEX Engine started for ticker: {CONFIG['ticker_symbol']}")
+    logging.info(f"Data will be saved to: {CONFIG['output_folder_path']}")
+    
+    ticker = yf.Ticker(CONFIG["ticker_symbol"])
+
+    while True:
+        logging.info("--- Starting new fetch cycle ---")
+        
+        spot, dfs = fetch_data(ticker, CONFIG["expiration_day_limit"])
+        
+        if spot and dfs:
+            process_and_save_data(dfs, spot, CONFIG)
+        else:
+            logging.warning("Skipping processing due to fetch failure.")
+            
+        cleanup_files(CONFIG)
+        
+        interval = CONFIG["fetch_interval_seconds"]
+        logging.info(f"--- Cycle finished. Sleeping for {interval / 60:.1f} minutes ---")
+        time.sleep(interval)
+
 
 if __name__ == "__main__":
-    run_parallel_fetcher()
+    main()
