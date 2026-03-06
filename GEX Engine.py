@@ -1,172 +1,192 @@
+# --- START OF FILE GEX Engine (Final).py ---
+
 import yfinance as yf
 import pandas as pd
-import time
 import os
-import datetime
+import time
+from datetime import datetime
+import concurrent.futures
 import logging
 
+# --- 1. SETTINGS ---
+# Use a dictionary for cleaner settings management
 CONFIG = {
-    "ticker_symbol": "^SPX", 
-    "future_symbol": "ES=F", # We need this to calculate the basis
-    "output_folder_path": r"C:\Options_History_Data",
-    "fetch_interval_seconds": 900,
-    "expiration_day_limit": 45,
-    "strike_filter_percentage": 15.0,
-    "hours_to_keep_files": 24
+    # List of tickers to fetch options for
+    "TICKERS": ["^SPX", "SPY", "QQQ"], 
+    
+    # For tickers that need a basis ratio (e.g., SPX vs ES), define their future symbol here
+    "BASIS_MAP": {
+        "^SPX": "ES=F"
+    },
+    
+    # How many of the nearest expirations to pull (Controls file size DRAMATICALLY)
+    "EXPIRATIONS_TO_PULL": 4,      
+    
+    # How often to fetch new data
+    "INTERVAL_SECONDS": 60,        
+    
+    # Where to save the files
+    "OUTPUT_DIR": r"C:\Options_History_Data",
+    
+    # Filter strikes to save disk space
+    "SPOT_PRICE_RANGE_PERCENT": 0.10, # +/- 10%
+    
+    # How many hours of old CSV files to keep. Set to 0 to disable.
+    "HOURS_TO_KEEP_FILES": 48 
 }
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# --- 2. SETUP ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S')
 
-def calculate_synced_basis():
-    """
-    Downloads 1m data for both SPX and ES. Finds the most recent minute 
-    where BOTH were trading to calculate a flawless Basis Ratio, ignoring ETH.
-    """
+if not os.path.exists(CONFIG["OUTPUT_DIR"]):
+    os.makedirs(CONFIG["OUTPUT_DIR"])
+
+# --- 3. HELPER FUNCTIONS ---
+
+def calculate_synced_basis(cash_ticker, future_ticker):
+    """Downloads 1m data and finds the last minute where both assets traded to get a stable basis."""
     try:
-        # Download last 5 days of 1-minute data for both to ensure we catch Friday->Monday
-        tickers = f"{CONFIG['ticker_symbol']} {CONFIG['future_symbol']}"
+        tickers = f"{cash_ticker} {future_ticker}"
         data = yf.download(tickers, period="5d", interval="1m", progress=False)['Close']
-        
-        # Drop rows where either SPX or ES has NaN (This instantly filters out ETH and post-market)
         synced_data = data.dropna()
         
         if synced_data.empty:
-            logging.error("Could not find synchronized timestamps for SPX and ES.")
-            return None, None
+            logging.warning(f"[{cash_ticker}] No synced basis found, will use ratio of 1.0")
+            return 1.0
 
-        # Get the absolute last row where both traded
         last_sync_row = synced_data.iloc[-1]
+        spx_price = float(last_sync_row[cash_ticker])
+        es_price = float(last_sync_row[future_ticker])
         
-        spx_sync_price = last_sync_row[CONFIG['ticker_symbol']]
-        es_sync_price = last_sync_row[CONFIG['future_symbol']]
+        if spx_price == 0: return 1.0 # Avoid division by zero
         
-        # Calculate Basis Ratio (e.g., 5120 / 5100 = 1.00392)
-        basis_ratio = es_sync_price / spx_sync_price
-        
-        logging.info(f"Synced Basis Calculated: ES @ {es_sync_price:.2f} / SPX @ {spx_sync_price:.2f} = {basis_ratio:.5f}")
-        return spx_sync_price, basis_ratio
+        basis_ratio = es_price / spx_price
+        logging.info(f"[{cash_ticker}] Synced Basis: {future_ticker} @ {es_price:.2f} / {cash_ticker} @ {spx_price:.2f} = {basis_ratio:.5f}")
+        return basis_ratio
 
     except Exception as e:
-        logging.error(f"Error calculating basis: {e}")
-        return None, None
+        logging.error(f"[{cash_ticker}] Basis calculation failed: {e}")
+        return 1.0 # Return a neutral ratio on failure
 
-def fetch_data(ticker_obj, expiration_limit_days):
-    # 1. Get the perfectly synced Spot Price and Basis Ratio
-    spot_price, basis_ratio = calculate_synced_basis()
-    if spot_price is None:
-        return None, None, []
+# --- 4. WORKER FUNCTION ---
 
+def fetch_and_store_ticker(symbol, config, current_time):
+    """The main function executed in parallel for each ticker."""
     try:
-        # 2. Fetch Options
-        all_expirations = ticker_obj.options
-        today = datetime.datetime.now()
-        limit_date = today + datetime.timedelta(days=expiration_limit_days)
+        tk_yf = yf.Ticker(symbol)
         
-        relevant_expirations = [exp for exp in all_expirations if datetime.datetime.strptime(exp, '%Y-%m-%d') <= limit_date]
+        # 1. Fetch Spot Price
+        spot_price = tk_yf.history(period="1d", interval="1m")['Close'].iloc[-1]
 
-        if not relevant_expirations:
-            return spot_price, basis_ratio, []
+        # 2. Calculate Basis Ratio (if applicable)
+        basis_ratio = 1.0 # Default for non-index tickers like SPY, QQQ
+        if symbol in config["BASIS_MAP"]:
+            basis_ratio = calculate_synced_basis(symbol, config["BASIS_MAP"][symbol])
 
-        all_options_dfs = []
-        for exp in relevant_expirations:
-            opt_chain = ticker_obj.option_chain(exp)
-            calls, puts = opt_chain.calls, opt_chain.puts
-            calls['Type'], calls['Expiration'] = 'Call', exp
-            puts['Type'], puts['Expiration'] = 'Put', exp
-            all_options_dfs.extend([calls, puts])
-            
-        return spot_price, basis_ratio, all_options_dfs
+        # 3. Fetch Options Data
+        expirations = tk_yf.options
+        if not expirations:
+            return symbol, 404, "No options data found."
 
-    except Exception as e:
-        logging.error(f"Error fetching options: {e}")
-        return None, None, []
+        all_options = []
+        for exp in expirations[:config["EXPIRATIONS_TO_PULL"]]:
+            try:
+                opt = tk_yf.option_chain(exp)
+                calls, puts = opt.calls, opt.puts
+                
+                if not calls.empty:
+                    calls['Type'], calls['Expiration'] = 'Call', exp
+                    all_options.append(calls)
+                if not puts.empty:
+                    puts['Type'], puts['Expiration'] = 'Put', exp
+                    all_options.append(puts)
+            except Exception:
+                continue # Skip expirations that fail to load
 
-def process_and_save_data(dataframes, spot_price, basis_ratio, config):
-    if not dataframes: return
+        if not all_options:
+            return symbol, 204, "Data fetched but chains were empty."
 
-    try:
-        full_df = pd.concat(dataframes, ignore_index=True)
-
-        # Filter strikes
-        strike_filter = config["strike_filter_percentage"] / 100.0
-        full_df = full_df[(full_df['strike'] >= spot_price * (1 - strike_filter)) & (full_df['strike'] <= spot_price * (1 + strike_filter))]
-
-        full_df['openInterest'] = full_df['openInterest'].fillna(0)
-        full_df['impliedVolatility'] = full_df['impliedVolatility'].fillna(0.0001)
+        # 4. Combine and Format Data
+        df = pd.concat(all_options, ignore_index=True)
         
-        # ADD TIMESTAMPS AND THE PRE-CALCULATED BASIS RATIO
-        full_df['Timestamp'] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        full_df['BasisRatio'] = round(basis_ratio, 6) # <--- Python did the math!
+        # Filter by price range
+        min_strike = spot_price * (1 - config["SPOT_PRICE_RANGE_PERCENT"])
+        max_strike = spot_price * (1 + config["SPOT_PRICE_RANGE_PERCENT"])
+        df = df[(df['strike'] >= min_strike) & (df['strike'] <= max_strike)]
         
-        final_df = full_df[[
+        # Clean data
+        df['openInterest'] = df['openInterest'].fillna(0).astype(int)
+        df['impliedVolatility'] = df['impliedVolatility'].fillna(0.0001)
+        
+        # Add required columns for NinjaTrader
+        df['Timestamp'] = current_time.strftime("%Y-%m-%d %H:%M:%S")
+        df['BasisRatio'] = round(basis_ratio, 6)
+        
+        # Select and rename
+        final_df = df[[
             'Timestamp', 'Expiration', 'BasisRatio', 'Type', 'strike', 'openInterest', 'impliedVolatility'
         ]].copy()
-        
         final_df.rename(columns={'strike': 'Strike', 'openInterest': 'OI', 'impliedVolatility': 'IV'}, inplace=True)
+
+        # 5. Save to ONE file per day, APPENDING data
+        clean_symbol = symbol.replace('^', '').replace('.', '_')
+        date_str = current_time.strftime("%Y-%m-%d")
+        file_name = f"{clean_symbol}_Options_{date_str}.csv"
+        file_path = os.path.join(config["OUTPUT_DIR"], file_name)
         
-        output_folder = config["output_folder_path"]
-        if not os.path.exists(output_folder): os.makedirs(output_folder)
-            
-        file_name = f"{config['ticker_symbol'].replace('^', '').replace('.', '_')}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        final_df.to_csv(os.path.join(output_folder, file_name), index=False)
-        logging.info(f"Saved {len(final_df)} strikes with Basis Ratio {basis_ratio:.5f}")
+        file_exists = os.path.isfile(file_path)
+        final_df.to_csv(file_path, mode='a', header=not file_exists, index=False)
+        
+        return symbol, 200, f"Appended {len(final_df)} strikes."
 
     except Exception as e:
-        logging.error(f"Failed to process/save data: {e}")
+        return symbol, 500, f"Internal Error: {e}"
 
-# ... (keep cleanup_files and main() exactly the same as before) ...
+# --- 5. CLEANUP FUNCTION ---
 
-def cleanup_files(config):
-    """
-    Deletes old CSV files from the output directory to save space.
-    """
+def cleanup_old_files(config):
+    """Deletes old CSV files from the output directory to save space."""
+    if config["HOURS_TO_KEEP_FILES"] <= 0: return
     try:
-        folder = config["output_folder_path"]
-        if not os.path.isdir(folder):
-            return
-
+        folder = config["OUTPUT_DIR"]
         now = time.time()
-        age_limit_seconds = config["hours_to_keep_files"] * 3600
-        cleaned_count = 0
-
+        age_limit_seconds = config["HOURS_TO_KEEP_FILES"] * 3600
+        
         for filename in os.listdir(folder):
-            file_path = os.path.join(folder, filename)
-            if os.stat(file_path).st_mtime < now - age_limit_seconds:
-                os.remove(file_path)
-                cleaned_count += 1
-        
-        if cleaned_count > 0:
-            logging.info(f"Cleaned up {cleaned_count} old data files.")
-            
+            if filename.endswith(".csv"):
+                file_path = os.path.join(folder, filename)
+                if os.stat(file_path).st_mtime < now - age_limit_seconds:
+                    os.remove(file_path)
     except Exception as e:
-        logging.error(f"Error during file cleanup: {e}")
+        logging.error(f"File cleanup failed: {e}")
 
+# --- 6. MAIN CONTROLLER LOOP ---
 
-def main():
-    """
-    Main loop to run the GEX data engine.
-    """
-    logging.info(f"GEX Engine started for ticker: {CONFIG['ticker_symbol']}")
-    logging.info(f"Data will be saved to: {CONFIG['output_folder_path']}")
+def run_parallel_fetcher(config):
+    logging.info(f"🚀 Starting GEX Engine for: {', '.join(config['TICKERS'])}")
     
-    ticker = yf.Ticker(CONFIG["ticker_symbol"])
-
     while True:
-        logging.info("--- Starting new fetch cycle ---")
+        loop_start_time = time.time()
+        current_time = datetime.now()
         
-        spot, dfs = fetch_data(ticker, CONFIG["expiration_day_limit"])
+        logging.info(f"--- 📡 Fetching data for {len(config['TICKERS'])} tickers ---")
         
-        if spot and dfs:
-            process_and_save_data(dfs, spot, CONFIG)
-        else:
-            logging.warning("Skipping processing due to fetch failure.")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(config['TICKERS'])) as executor:
+            futures = [executor.submit(fetch_and_store_ticker, ticker, config, current_time) for ticker in config['TICKERS']]
             
-        cleanup_files(CONFIG)
-        
-        interval = CONFIG["fetch_interval_seconds"]
-        logging.info(f"--- Cycle finished. Sleeping for {interval / 60:.1f} minutes ---")
-        time.sleep(interval)
+            for future in concurrent.futures.as_completed(futures):
+                symbol, status_code, message = future.result()
+                if status_code == 200:
+                    logging.info(f"  ✅ {symbol:<5} -> {message}")
+                else:
+                    logging.warning(f"  ⚠️ [{status_code}] {symbol:<5} -> {message}")
 
+        cleanup_old_files(config)
+        
+        execution_time = time.time() - loop_start_time
+        sleep_time = max(0, config["INTERVAL_SECONDS"] - execution_time)
+        logging.info(f"--- Cycle took {execution_time:.2f}s. Sleeping for {sleep_time:.2f}s ---\n")
+        time.sleep(sleep_time)
 
 if __name__ == "__main__":
-    main()
+    run_parallel_fetcher(CONFIG)
