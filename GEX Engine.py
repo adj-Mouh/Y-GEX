@@ -115,3 +115,58 @@ def process_and_save_data(dataframes, spot_price, basis_ratio, config):
         logging.error(f"Failed to process/save data: {e}")
 
 # ... (keep cleanup_files and main() exactly the same as before) ...
+
+def cleanup_files(config):
+    """
+    Deletes old CSV files from the output directory to save space.
+    """
+    try:
+        folder = config["output_folder_path"]
+        if not os.path.isdir(folder):
+            return
+
+        now = time.time()
+        age_limit_seconds = config["hours_to_keep_files"] * 3600
+        cleaned_count = 0
+
+        for filename in os.listdir(folder):
+            file_path = os.path.join(folder, filename)
+            if os.stat(file_path).st_mtime < now - age_limit_seconds:
+                os.remove(file_path)
+                cleaned_count += 1
+        
+        if cleaned_count > 0:
+            logging.info(f"Cleaned up {cleaned_count} old data files.")
+            
+    except Exception as e:
+        logging.error(f"Error during file cleanup: {e}")
+
+
+def main():
+    """
+    Main loop to run the GEX data engine.
+    """
+    logging.info(f"GEX Engine started for ticker: {CONFIG['ticker_symbol']}")
+    logging.info(f"Data will be saved to: {CONFIG['output_folder_path']}")
+    
+    ticker = yf.Ticker(CONFIG["ticker_symbol"])
+
+    while True:
+        logging.info("--- Starting new fetch cycle ---")
+        
+        spot, dfs = fetch_data(ticker, CONFIG["expiration_day_limit"])
+        
+        if spot and dfs:
+            process_and_save_data(dfs, spot, CONFIG)
+        else:
+            logging.warning("Skipping processing due to fetch failure.")
+            
+        cleanup_files(CONFIG)
+        
+        interval = CONFIG["fetch_interval_seconds"]
+        logging.info(f"--- Cycle finished. Sleeping for {interval / 60:.1f} minutes ---")
+        time.sleep(interval)
+
+
+if __name__ == "__main__":
+    main()
