@@ -9,29 +9,26 @@ import concurrent.futures
 import logging
 
 # --- 1. SETTINGS ---
-# Use a dictionary for cleaner settings management
 CONFIG = {
-    # List of tickers to fetch options for
-    "TICKERS": ["^SPX", "SPY", "QQQ"], 
+    # Added major indices to automatically track
+    "TICKERS": ["^SPX", "^NDX", "^RUT", "SPY", "QQQ"], 
     
-    # For tickers that need a basis ratio (e.g., SPX vs ES), define their future symbol here
+    # Automatically calculates the basis ratio for all major assets
     "BASIS_MAP": {
-        "^SPX": "ES=F"
+        "^SPX": "ES=F",    # S&P 500 Index to ES Futures
+        "SPY": "ES=F",     # SPY ETF to ES Futures
+        "^NDX": "NQ=F",    # Nasdaq 100 Index to NQ Futures
+        "QQQ": "NQ=F",     # QQQ ETF to NQ Futures
+        "^RUT": "RTY=F",   # Russell 2000 Index to RTY Futures
+        "IWM": "RTY=F",    # IWM ETF to RTY Futures
+        "^DJI": "YM=F",    # Dow Jones Index to YM Futures
+        "DIA": "YM=F"      # DIA ETF to YM Futures
     },
     
-    # How many of the nearest expirations to pull (Controls file size DRAMATICALLY)
     "EXPIRATIONS_TO_PULL": 4,      
-    
-    # How often to fetch new data
     "INTERVAL_SECONDS": 60,        
-    
-    # Where to save the files
-    "OUTPUT_DIR": r"\Options_History_Data",
-    
-    # Filter strikes to save disk space
-    "SPOT_PRICE_RANGE_PERCENT": 0.10, # +/- 10%
-    
-    # How many hours of old CSV files to keep. Set to 0 to disable.
+    "OUTPUT_DIR": r"C:\Options_History_Data", # Made absolute path for safety
+    "SPOT_PRICE_RANGE_PERCENT": 0.10, 
     "HOURS_TO_KEEP_FILES": 48 
 }
 
@@ -55,13 +52,13 @@ def calculate_synced_basis(cash_ticker, future_ticker):
             return 1.0
 
         last_sync_row = synced_data.iloc[-1]
-        spx_price = float(last_sync_row[cash_ticker])
-        es_price = float(last_sync_row[future_ticker])
+        cash_price = float(last_sync_row[cash_ticker])
+        future_price = float(last_sync_row[future_ticker])
         
-        if spx_price == 0: return 1.0 # Avoid division by zero
+        if cash_price == 0: return 1.0 # Avoid division by zero
         
-        basis_ratio = es_price / spx_price
-        logging.info(f"[{cash_ticker}] Synced Basis: {future_ticker} @ {es_price:.2f} / {cash_ticker} @ {spx_price:.2f} = {basis_ratio:.5f}")
+        basis_ratio = future_price / cash_price
+        logging.info(f"[{cash_ticker}] Synced Basis: {future_ticker} @ {future_price:.2f} / {cash_ticker} @ {cash_price:.2f} = {basis_ratio:.5f}")
         return basis_ratio
 
     except Exception as e:
@@ -71,15 +68,14 @@ def calculate_synced_basis(cash_ticker, future_ticker):
 # --- 4. WORKER FUNCTION ---
 
 def fetch_and_store_ticker(symbol, config, current_time):
-    """The main function executed in parallel for each ticker."""
     try:
         tk_yf = yf.Ticker(symbol)
         
         # 1. Fetch Spot Price
         spot_price = tk_yf.history(period="1d", interval="1m")['Close'].iloc[-1]
 
-        # 2. Calculate Basis Ratio (if applicable)
-        basis_ratio = 1.0 # Default for non-index tickers like SPY, QQQ
+        # 2. Calculate Basis Ratio
+        basis_ratio = 1.0
         if symbol in config["BASIS_MAP"]:
             basis_ratio = calculate_synced_basis(symbol, config["BASIS_MAP"][symbol])
 
@@ -101,7 +97,7 @@ def fetch_and_store_ticker(symbol, config, current_time):
                     puts['Type'], puts['Expiration'] = 'Put', exp
                     all_options.append(puts)
             except Exception:
-                continue # Skip expirations that fail to load
+                continue
 
         if not all_options:
             return symbol, 204, "Data fetched but chains were empty."
@@ -109,26 +105,22 @@ def fetch_and_store_ticker(symbol, config, current_time):
         # 4. Combine and Format Data
         df = pd.concat(all_options, ignore_index=True)
         
-        # Filter by price range
         min_strike = spot_price * (1 - config["SPOT_PRICE_RANGE_PERCENT"])
         max_strike = spot_price * (1 + config["SPOT_PRICE_RANGE_PERCENT"])
         df = df[(df['strike'] >= min_strike) & (df['strike'] <= max_strike)]
         
-        # Clean data
         df['openInterest'] = df['openInterest'].fillna(0).astype(int)
         df['impliedVolatility'] = df['impliedVolatility'].fillna(0.0001)
         
-        # Add required columns for NinjaTrader
         df['Timestamp'] = current_time.strftime("%Y-%m-%d %H:%M:%S")
         df['BasisRatio'] = round(basis_ratio, 6)
         
-        # Select and rename
         final_df = df[[
             'Timestamp', 'Expiration', 'BasisRatio', 'Type', 'strike', 'openInterest', 'impliedVolatility'
         ]].copy()
         final_df.rename(columns={'strike': 'Strike', 'openInterest': 'OI', 'impliedVolatility': 'IV'}, inplace=True)
 
-        # 5. Save to ONE file per day, APPENDING data
+        # 5. Save Data
         clean_symbol = symbol.replace('^', '').replace('.', '_')
         date_str = current_time.strftime("%Y-%m-%d")
         file_name = f"{clean_symbol}_Options_{date_str}.csv"
@@ -145,7 +137,6 @@ def fetch_and_store_ticker(symbol, config, current_time):
 # --- 5. CLEANUP FUNCTION ---
 
 def cleanup_old_files(config):
-    """Deletes old CSV files from the output directory to save space."""
     if config["HOURS_TO_KEEP_FILES"] <= 0: return
     try:
         folder = config["OUTPUT_DIR"]
