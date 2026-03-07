@@ -21,22 +21,30 @@ using SharpDX;
 
 namespace NinjaTrader.NinjaScript.Indicators
 {
+	// Enum for the new Dropdown Selection
+	public enum GexDisplayMode
+	{
+		NetGEX,
+		CallsOnly,
+		PutsOnly
+	}
+
 	public class GexHeatmap : Indicator
 	{
 		#region Helper Classes & Structs
 		public class OptionData
 		{
-			public DateTime ExpirationUtc; // Universal Time for accurate decay
+			public DateTime ExpirationUtc; 
 			public bool IsCall;
-			public double Strike; // Raw SPX Strike
+			public double Strike; 
 			public int OI;
 			public double IV;
 		}
 
 		public class GexSnapshot
 		{
-			public DateTime Timestamp; // When Python fetched the data
-			public double BasisRatio;  // The calculated ES/SPX ratio from Python
+			public DateTime Timestamp; 
+			public double BasisRatio;  
 			public Dictionary<double, List<OptionData>> Strikes = new Dictionary<double, List<OptionData>>();
 		}
 
@@ -44,7 +52,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		{
 			public DateTime SnapshotTime;
 			public double BarStrikeInterval;
-			public Dictionary<double, double> StrikeToNetGex = new Dictionary<double, double>();
+			public Dictionary<double, double> StrikeToGex = new Dictionary<double, double>();
 			public Dictionary<double, int> StrikeToTotalOI = new Dictionary<double, int>();
 		}
 
@@ -52,7 +60,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		{
 			public SharpDX.RectangleF Bounds;
 			public double Strike;
-			public double NetGex;
+			public double ValueGex;
 			public int TotalOI;
 		}
 		#endregion
@@ -62,29 +70,24 @@ namespace NinjaTrader.NinjaScript.Indicators
 		private Series<GexBarData> gexSeries;
 		private bool isDataLoaded = false;
 
-		// Rendering Resources
 		private SharpDX.Direct2D1.SolidColorBrush[] positiveBrushes; 
 		private SharpDX.Direct2D1.SolidColorBrush[] negativeBrushes; 
 		
-		// Interaction
 		private List<GexHitInfo> hitTestList = new List<GexHitInfo>();
 		private GexHitInfo hoveredCell = null;
 		private bool showTooltip = false;
 		private bool isMouseSubscribed = false;
 		private SharpDX.Vector2 mousePosition;
 
-		// Tooltip Resources
 		private SharpDX.DirectWrite.TextFormat tooltipTextFormat;
 		private SharpDX.Direct2D1.SolidColorBrush tooltipBgBrush;
 		private SharpDX.Direct2D1.SolidColorBrush tooltipBorderBrush;
 		private SharpDX.Direct2D1.SolidColorBrush tooltipTextBrush;
 		
-		// Timers
 		private DispatcherTimer hoverTimer;
 		private DispatcherTimer fileCheckTimer;
 		private DateTime lastFileReadTime = DateTime.MinValue;
 		
-		// Timezone handling for 0-DTE accuracy
 		private TimeZoneInfo easternZone;
 		#endregion
 
@@ -94,7 +97,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		public string CsvFolderPath { get; set; }
 
 		[NinjaScriptProperty]
-		[Display(Name="Ticker Override", Description="Force read a specific ticker (e.g. SPX) regardless of chart symbol.", Order=2, GroupName="Parameters")]
+		[Display(Name="Ticker Override", Description="Leave empty to auto-map (e.g. ES->SPX). Enter a ticker to force read (e.g. SPY).", Order=2, GroupName="Parameters")]
 		public string TickerOverride { get; set; }
 
 		[NinjaScriptProperty]
@@ -106,6 +109,11 @@ namespace NinjaTrader.NinjaScript.Indicators
 		[Range(1, 120)]
 		[Display(Name="Max Data Age (Min)", Description="Stop plotting if CSV data is older than this to prevent staleness.", Order=4, GroupName="Parameters")]
 		public int MaxDataAgeMinutes { get; set; }
+
+		// NEW PARAMETER: Display Mode
+		[NinjaScriptProperty]
+		[Display(Name="Display Mode", Description="Choose which GEX to display: Net (Calls - Puts), Calls Only, or Puts Only.", Order=5, GroupName="Parameters")]
+		public GexDisplayMode DisplayMode { get; set; }
 		#endregion
 
 		protected override void OnStateChange()
@@ -122,15 +130,15 @@ namespace NinjaTrader.NinjaScript.Indicators
 				ScaleJustification							= NinjaTrader.Gui.Chart.ScaleJustification.Right;
 				
 				CsvFolderPath								= @"C:\Options_History_Data";
-				TickerOverride                              = "SPX"; // Set default to SPX for ease of use
+				TickerOverride                              = ""; 
 				CutoffPercent								= 2.0; 
 				MaxDataAgeMinutes							= 5;
+				DisplayMode                                 = GexDisplayMode.NetGEX; // Default to Net
 			}
 			else if (State == State.Configure)
 			{
-				ZOrder = -1; // Draw behind candles
+				ZOrder = -1; 
 				
-				// Initialize TimeZone for converting Expirations to UTC
 				try { easternZone = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time"); }
 				catch 
 				{ 
@@ -145,10 +153,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 				positiveBrushes = new SharpDX.Direct2D1.SolidColorBrush[256];
 				negativeBrushes = new SharpDX.Direct2D1.SolidColorBrush[256];
 
-				// Initial Load
 				LoadGexDataFromCsv();
 
-				// Setup Auto-Reload Timer
 				if (fileCheckTimer == null)
 				{
 					fileCheckTimer = new DispatcherTimer();
@@ -178,12 +184,39 @@ namespace NinjaTrader.NinjaScript.Indicators
 			}
 		}
 
+		private string GetMappedTicker()
+		{
+			if (!string.IsNullOrEmpty(TickerOverride))
+				return TickerOverride.Replace("^", "").Replace(".", "_");
+
+			string instrName = Instrument.MasterInstrument.Name.ToUpper();
+
+			switch (instrName)
+			{
+				case "ES":
+				case "MES":
+					return "SPX"; 
+				case "NQ":
+				case "MNQ":
+					return "NDX"; 
+				case "RTY":
+				case "M2K":
+					return "RUT"; 
+				case "YM":
+				case "MYM":
+					return "DJI"; 
+				default:
+					return instrName; 
+			}
+		}
+
 		private void OnFileCheckTimerTick(object sender, EventArgs e)
 		{
 			try
 			{
 				if (!Directory.Exists(CsvFolderPath)) return;
-				string targetName = !string.IsNullOrEmpty(TickerOverride) ? TickerOverride.Replace("^", "").Replace(".", "_") : Instrument.MasterInstrument.Name.Replace("^", "").Replace(".", "_");
+				
+				string targetName = GetMappedTicker();
 				string searchPattern = string.Format("*{0}*.csv", targetName);
 				string[] files = Directory.GetFiles(CsvFolderPath, searchPattern);
 
@@ -194,7 +227,6 @@ namespace NinjaTrader.NinjaScript.Indicators
 				{
 					DateTime fileWriteTime = File.GetLastWriteTime(file);
 					
-					// Detects if the Python script has appended new data
 					if (fileWriteTime > lastFileReadTime)
 					{
 						hasNewData = true;
@@ -218,7 +250,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 			{
 				if (!Directory.Exists(CsvFolderPath) || easternZone == null) return;
 
-				string targetName = !string.IsNullOrEmpty(TickerOverride) ? TickerOverride.Replace("^", "").Replace(".", "_") : Instrument.MasterInstrument.Name.Replace("^", "").Replace(".", "_");
+				string targetName = GetMappedTicker();
 				string searchPattern = string.Format("*{0}*.csv", targetName);
 				string[] files = Directory.GetFiles(CsvFolderPath, searchPattern);
 
@@ -238,31 +270,26 @@ namespace NinjaTrader.NinjaScript.Indicators
 						using (StreamReader sr = new StreamReader(fs))
 						{
 							string header = sr.ReadLine(); 
-							if (header == null) continue; // Safety: File exists but is completely empty
+							if (header == null) continue; 
 
 							string line;
 							while ((line = sr.ReadLine()) != null)
 							{
-								// Safety: Ignore empty lines or stray headers that Python might append by mistake
 								if (string.IsNullOrWhiteSpace(line) || line.Contains("Timestamp")) continue;
 								
 								string[] cols = line.Split(',');
-								// Expected: Timestamp, Expiration, BasisRatio, Type, Strike, OI, IV
 								if (cols.Length < 7) continue;
 
 								try 
 								{
 									DateTime timestamp = DateTime.ParseExact(cols[0], "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture);
 									
-									// 1. Handle Expiration (Fix 0-DTE timing)
 									DateTime expirationDate = DateTime.ParseExact(cols[1], "yyyy-MM-dd", CultureInfo.InvariantCulture);
-									DateTime expirationAt4pm = expirationDate.AddHours(16); // 16:00 (4 PM)
+									DateTime expirationAt4pm = expirationDate.AddHours(16); 
 									DateTime expirationUtc = TimeZoneInfo.ConvertTimeToUtc(expirationAt4pm, easternZone);
 									
-									// 2. Read Basis Ratio from Python
 									double basisRatio = double.Parse(cols[2], CultureInfo.InvariantCulture);
 									
-									// 3. Option Details
 									bool isCall = cols[3].Trim().Equals("Call", StringComparison.OrdinalIgnoreCase);
 									double strike = double.Parse(cols[4], CultureInfo.InvariantCulture);
 									int oi = (int)double.Parse(cols[5], CultureInfo.InvariantCulture);
@@ -282,8 +309,6 @@ namespace NinjaTrader.NinjaScript.Indicators
 					}
 					catch (IOException)
 					{
-						// File Lock Collision Protection: Python is actively writing to the file. 
-						// Skip it for now, the timer will pick it up on the next 5 second loop.
 						continue; 
 					}
 				}
@@ -331,24 +356,16 @@ namespace NinjaTrader.NinjaScript.Indicators
 		{
 			if (CurrentBar < 0 || !isDataLoaded) return;
 
-			// 1. Get the current bar time in UTC (to match our Option Expirations)
 			DateTime currentBarTimeUtc = Time[0].ToUniversalTime();
 			
-			// 2. Find the relevant option snapshot
 			GexSnapshot closestSnap = GetClosestSnapshot(Time[0]);
 			if (closestSnap == null) return;
 			
-			// 3. Staleness Check: If data is older than X minutes, stop plotting to avoid misleading charts
 			if ((Time[0] - closestSnap.Timestamp).TotalMinutes > MaxDataAgeMinutes) return;
 
-			// 4. Get Spot Price (ES Futures Live Price)
 			double spotPrice = Close[0];
-
-			// 5. Get the Basis Ratio (Calculated by Python to handle ETH/Open/Close syncing)
 			double basisRatio = closestSnap.BasisRatio; 
 
-			// 6. Calculate Vertical Bar Height for drawing
-			// We stretch the interval by the basis ratio so visual blocks don't overlap or gap
 			var sortedStrikes = closestSnap.Strikes.Keys.OrderBy(k => k).ToList();
 			double minDiff = double.MaxValue;
 			for (int i = 1; i < sortedStrikes.Count; i++)
@@ -362,43 +379,47 @@ namespace NinjaTrader.NinjaScript.Indicators
 			barData.SnapshotTime = closestSnap.Timestamp; 
 			barData.BarStrikeInterval = barInterval;
 
-			// 7. Calculate GEX
 			foreach (var kvp in closestSnap.Strikes)
 			{
-				// Shift the SPX strike to match the ES chart using the Basis Ratio
 				double adjustedStrike = kvp.Key * basisRatio;
 				
-				double netGex = 0.0;
+				double displayGex = 0.0;
 				int totalOi = 0;
 
 				foreach (var opt in kvp.Value)
 				{
-					// Time to Expiry: (Expiration UTC - Current Bar UTC) / 365
 					double T = Math.Max(0.00001, (opt.ExpirationUtc - currentBarTimeUtc).TotalDays / 365.0);
 					
-					// Black-Scholes Gamma
-					// S = Live ES Price
-					// K = Shifted Strike
-					// T = Accurate Time Decay
 					double gamma = CalculateGamma(spotPrice, adjustedStrike, T, opt.IV);
-					
-					// Standard GEX Formula: Gamma * OI * 100 Shares
 					double gex = gamma * opt.OI * 100.0;
 					
-					if (opt.IsCall) netGex += gex;
-					else netGex -= gex; 
-
-					totalOi += opt.OI;
+					// Apply Selection Filter
+					if (opt.IsCall)
+					{
+						if (DisplayMode == GexDisplayMode.NetGEX || DisplayMode == GexDisplayMode.CallsOnly)
+						{
+							displayGex += gex;
+							totalOi += opt.OI;
+						}
+					}
+					else
+					{
+						if (DisplayMode == GexDisplayMode.NetGEX || DisplayMode == GexDisplayMode.PutsOnly)
+						{
+							displayGex -= gex; // Puts stay negative (red) for visual consistency
+							totalOi += opt.OI;
+						}
+					}
 				}
 
-				if (barData.StrikeToNetGex.ContainsKey(adjustedStrike))
+				if (barData.StrikeToGex.ContainsKey(adjustedStrike))
 				{
-					barData.StrikeToNetGex[adjustedStrike] += netGex;
+					barData.StrikeToGex[adjustedStrike] += displayGex;
 					barData.StrikeToTotalOI[adjustedStrike] += totalOi;
 				}
 				else
 				{
-					barData.StrikeToNetGex[adjustedStrike] = netGex;
+					barData.StrikeToGex[adjustedStrike] = displayGex;
 					barData.StrikeToTotalOI[adjustedStrike] = totalOi;
 				}
 			}
@@ -431,11 +452,9 @@ namespace NinjaTrader.NinjaScript.Indicators
 				for (int i = 0; i < 256; i++)
 				{
 					double ratio = i / 255.0;
-					// Blue/Cyan for Positive GEX
 					System.Windows.Media.Color posColor = InterpolateColor(System.Windows.Media.Color.FromRgb(10, 20, 40), System.Windows.Media.Color.FromRgb(0, 200, 255), ratio);
 					positiveBrushes[i] = new SharpDX.Direct2D1.SolidColorBrush(RenderTarget, new SharpDX.Color(posColor.R, posColor.G, posColor.B)) { Opacity = 0.6f };
 					
-					// Red/Orange for Negative GEX
 					System.Windows.Media.Color negColor = InterpolateColor(System.Windows.Media.Color.FromRgb(40, 10, 10), System.Windows.Media.Color.FromRgb(255, 100, 0), ratio);
 					negativeBrushes[i] = new SharpDX.Direct2D1.SolidColorBrush(RenderTarget, new SharpDX.Color(negColor.R, negColor.G, negColor.B)) { Opacity = 0.6f };
 				}
@@ -467,7 +486,6 @@ namespace NinjaTrader.NinjaScript.Indicators
 			double maxPrice = chartScale.MaxValue;
 			double maxAbsGex = 0.0001; 
 
-			// Find last valid bar index to know where to project lines
 			int lastValidIndex = -1;
 			for (int i = ChartBars.ToIndex; i >= ChartBars.FromIndex; i--)
 			{
@@ -478,13 +496,12 @@ namespace NinjaTrader.NinjaScript.Indicators
 				}
 			}
 
-			// Calculate Max GEX for this specific view (Relative Scaling)
 			for (int i = ChartBars.FromIndex; i <= ChartBars.ToIndex; i++)
 			{
 				if (!gexSeries.IsValidDataPointAt(i)) continue;
 				GexBarData data = gexSeries.GetValueAt(i);
 				if (data == null) continue;
-				foreach(var kvp in data.StrikeToNetGex)
+				foreach(var kvp in data.StrikeToGex)
 				{
 					if (kvp.Key >= minPrice && kvp.Key <= maxPrice)
 						maxAbsGex = Math.Max(maxAbsGex, Math.Abs(kvp.Value));
@@ -502,7 +519,6 @@ namespace NinjaTrader.NinjaScript.Indicators
 				float x1 = chartControl.GetXByBarIndex(ChartBars, i);
 				float x2 = chartControl.GetXByBarIndex(ChartBars, i + 1);
 				
-				// Extend the last valid bar to the right edge if data is fresh
 				if (i == lastValidIndex)
 				{
 					DateTime screenEndTime = Bars.GetTime(ChartBars.ToIndex);
@@ -514,15 +530,14 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 				float width = Math.Max(1f, x2 - x1);
 
-				foreach (var kvp in data.StrikeToNetGex)
+				foreach (var kvp in data.StrikeToGex)
 				{
 					double strike = kvp.Key;
-					double netGex = kvp.Value;
+					double gexVal = kvp.Value;
 
-					// Only draw visible strikes
 					if (strike > maxPrice + data.BarStrikeInterval || strike < minPrice - data.BarStrikeInterval) continue;
 
-					double gexRatio = Math.Abs(netGex) / maxAbsGex;
+					double gexRatio = Math.Abs(gexVal) / maxAbsGex;
 					if (gexRatio < (CutoffPercent / 100.0)) continue; 
 
 					float yTop = chartScale.GetYByValue(strike + (data.BarStrikeInterval / 2.0));
@@ -533,10 +548,10 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 					SharpDX.RectangleF rect = new SharpDX.RectangleF(x1, yDraw, width, height);
 					int brushIndex = Math.Max(0, Math.Min(255, (int)(gexRatio * 255)));
-					var brush = netGex >= 0 ? positiveBrushes[brushIndex] : negativeBrushes[brushIndex];
+					var brush = gexVal >= 0 ? positiveBrushes[brushIndex] : negativeBrushes[brushIndex];
 
 					RenderTarget.FillRectangle(rect, brush);
-					frameHitList.Add(new GexHitInfo { Bounds = rect, Strike = strike, NetGex = netGex, TotalOI = data.StrikeToTotalOI[strike] });
+					frameHitList.Add(new GexHitInfo { Bounds = rect, Strike = strike, ValueGex = gexVal, TotalOI = data.StrikeToTotalOI[strike] });
 				}
 			}
 
@@ -548,7 +563,11 @@ namespace NinjaTrader.NinjaScript.Indicators
 		private void DrawTooltip(GexHitInfo info)
 		{
 			if (tooltipTextFormat == null || tooltipBgBrush == null) return;
-			string text = string.Format("Total OI: {0:N0}\nGEX: {1:N2}", info.TotalOI, info.NetGex);
+			
+			string modeLabel = DisplayMode == GexDisplayMode.CallsOnly ? "Call GEX" : 
+			                   DisplayMode == GexDisplayMode.PutsOnly ? "Put GEX" : "Net GEX";
+
+			string text = string.Format("Total OI: {0:N0}\n{1}: {2:N2}", info.TotalOI, modeLabel, info.ValueGex);
 
 			using (var layout = new SharpDX.DirectWrite.TextLayout(NinjaTrader.Core.Globals.DirectWriteFactory, text, tooltipTextFormat, 250, 100))
 			{
@@ -586,28 +605,4 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 			if (ChartControl == null) return;
 			System.Windows.Point wpfPoint = e.GetPosition(ChartControl as System.Windows.IInputElement);
-			mousePosition = new SharpDX.Vector2((float)wpfPoint.X, (float)wpfPoint.Y);
-
-			GexHitInfo found = hitTestList.LastOrDefault(hit => hit.Bounds.Contains(mousePosition));
-
-			if (found != null)
-			{
-				if (hoveredCell != found)
-				{
-					hoveredCell = found;
-					showTooltip = false;
-					hoverTimer.Stop();
-					hoverTimer.Start();
-				}
-			}
-			else if (hoveredCell != null)
-			{
-				hoveredCell = null;
-				showTooltip = false;
-				hoverTimer.Stop();
-				ChartControl.InvalidateVisual();
-			}
-		}
-		#endregion
-	}
-}
+			mousePosition = new SharpDX.Vector2((floa
