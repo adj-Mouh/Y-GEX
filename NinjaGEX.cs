@@ -122,7 +122,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 				ScaleJustification							= NinjaTrader.Gui.Chart.ScaleJustification.Right;
 				
 				CsvFolderPath								= @"C:\Options_History_Data";
-				TickerOverride                              = ""; 
+				TickerOverride                              = "SPX"; // Set default to SPX for ease of use
 				CutoffPercent								= 2.0; 
 				MaxDataAgeMinutes							= 5;
 			}
@@ -193,6 +193,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 				foreach (string file in files)
 				{
 					DateTime fileWriteTime = File.GetLastWriteTime(file);
+					
+					// Detects if the Python script has appended new data
 					if (fileWriteTime > lastFileReadTime)
 					{
 						hasNewData = true;
@@ -230,53 +232,68 @@ namespace NinjaTrader.NinjaScript.Indicators
 					DateTime fileWriteTime = File.GetLastWriteTime(file);
 					if (fileWriteTime > maxWriteTime) maxWriteTime = fileWriteTime;
 
-					using (FileStream fs = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-					using (StreamReader sr = new StreamReader(fs))
+					try
 					{
-						string header = sr.ReadLine(); // Skip header
-						string line;
-						while ((line = sr.ReadLine()) != null)
+						using (FileStream fs = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+						using (StreamReader sr = new StreamReader(fs))
 						{
-							if (string.IsNullOrWhiteSpace(line)) continue;
-							string[] cols = line.Split(',');
-							// Expected: Timestamp, Expiration, BasisRatio, Type, Strike, OI, IV
-							if (cols.Length < 7) continue;
+							string header = sr.ReadLine(); 
+							if (header == null) continue; // Safety: File exists but is completely empty
 
-							try 
+							string line;
+							while ((line = sr.ReadLine()) != null)
 							{
-								DateTime timestamp = DateTime.ParseExact(cols[0], "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture);
+								// Safety: Ignore empty lines or stray headers that Python might append by mistake
+								if (string.IsNullOrWhiteSpace(line) || line.Contains("Timestamp")) continue;
 								
-								// 1. Handle Expiration (Fix 0-DTE timing)
-								// Parse date, set time to 4:00 PM EST, convert to UTC
-								DateTime expirationDate = DateTime.ParseExact(cols[1], "yyyy-MM-dd", CultureInfo.InvariantCulture);
-								DateTime expirationAt4pm = expirationDate.AddHours(16); // 16:00 (4 PM)
-								DateTime expirationUtc = TimeZoneInfo.ConvertTimeToUtc(expirationAt4pm, easternZone);
-								
-								// 2. Read Basis Ratio from Python
-								double basisRatio = double.Parse(cols[2], CultureInfo.InvariantCulture);
-								
-								// 3. Option Details
-								bool isCall = cols[3].Trim().Equals("Call", StringComparison.OrdinalIgnoreCase);
-								double strike = double.Parse(cols[4], CultureInfo.InvariantCulture);
-								int oi = (int)double.Parse(cols[5], CultureInfo.InvariantCulture);
-								double iv = double.Parse(cols[6], CultureInfo.InvariantCulture);
+								string[] cols = line.Split(',');
+								// Expected: Timestamp, Expiration, BasisRatio, Type, Strike, OI, IV
+								if (cols.Length < 7) continue;
 
-								if (!tempSnapshots.ContainsKey(timestamp))
-									tempSnapshots[timestamp] = new GexSnapshot { Timestamp = timestamp, BasisRatio = basisRatio };
+								try 
+								{
+									DateTime timestamp = DateTime.ParseExact(cols[0], "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture);
+									
+									// 1. Handle Expiration (Fix 0-DTE timing)
+									DateTime expirationDate = DateTime.ParseExact(cols[1], "yyyy-MM-dd", CultureInfo.InvariantCulture);
+									DateTime expirationAt4pm = expirationDate.AddHours(16); // 16:00 (4 PM)
+									DateTime expirationUtc = TimeZoneInfo.ConvertTimeToUtc(expirationAt4pm, easternZone);
+									
+									// 2. Read Basis Ratio from Python
+									double basisRatio = double.Parse(cols[2], CultureInfo.InvariantCulture);
+									
+									// 3. Option Details
+									bool isCall = cols[3].Trim().Equals("Call", StringComparison.OrdinalIgnoreCase);
+									double strike = double.Parse(cols[4], CultureInfo.InvariantCulture);
+									int oi = (int)double.Parse(cols[5], CultureInfo.InvariantCulture);
+									double iv = double.Parse(cols[6], CultureInfo.InvariantCulture);
 
-								var snap = tempSnapshots[timestamp];
-								if (!snap.Strikes.ContainsKey(strike)) snap.Strikes[strike] = new List<OptionData>();
+									if (!tempSnapshots.ContainsKey(timestamp))
+										tempSnapshots[timestamp] = new GexSnapshot { Timestamp = timestamp, BasisRatio = basisRatio };
 
-								snap.Strikes[strike].Add(new OptionData { ExpirationUtc = expirationUtc, IsCall = isCall, Strike = strike, OI = oi, IV = iv });
+									var snap = tempSnapshots[timestamp];
+									if (!snap.Strikes.ContainsKey(strike)) snap.Strikes[strike] = new List<OptionData>();
+
+									snap.Strikes[strike].Add(new OptionData { ExpirationUtc = expirationUtc, IsCall = isCall, Strike = strike, OI = oi, IV = iv });
+								}
+								catch { } 
 							}
-							catch { } 
 						}
+					}
+					catch (IOException)
+					{
+						// File Lock Collision Protection: Python is actively writing to the file. 
+						// Skip it for now, the timer will pick it up on the next 5 second loop.
+						continue; 
 					}
 				}
 
-				historicalSnapshots = tempSnapshots.Values.OrderBy(x => x.Timestamp).ToList();
-				isDataLoaded = historicalSnapshots.Count > 0;
-				lastFileReadTime = maxWriteTime;
+				if (tempSnapshots.Count > 0)
+				{
+					historicalSnapshots = tempSnapshots.Values.OrderBy(x => x.Timestamp).ToList();
+					isDataLoaded = historicalSnapshots.Count > 0;
+					lastFileReadTime = maxWriteTime;
+				}
 			}
 			catch (Exception ex) { Print("GEX Loader Error: " + ex.Message); }
 		}
