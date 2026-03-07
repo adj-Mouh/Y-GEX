@@ -19,15 +19,17 @@ using SharpDX.DirectWrite;
 using SharpDX;
 #endregion
 
+
+
+public enum GexDisplayMode
+{
+		NetGex,
+		CallGexOnly,
+		PutGexOnly
+}
 namespace NinjaTrader.NinjaScript.Indicators
 {
-	// Enum for the new Dropdown Selection
-	public enum GexDisplayMode
-	{
-		NetGEX,
-		CallsOnly,
-		PutsOnly
-	}
+
 
 	public class GexHeatmap : Indicator
 	{
@@ -52,7 +54,14 @@ namespace NinjaTrader.NinjaScript.Indicators
 		{
 			public DateTime SnapshotTime;
 			public double BarStrikeInterval;
-			public Dictionary<double, double> StrikeToGex = new Dictionary<double, double>();
+			
+			// Stores Net (Call - Put)
+			public Dictionary<double, double> StrikeToNetGex = new Dictionary<double, double>();
+			// Stores Call GEX only (Positive)
+			public Dictionary<double, double> StrikeToCallGex = new Dictionary<double, double>();
+			// Stores Put GEX only (Negative)
+			public Dictionary<double, double> StrikeToPutGex = new Dictionary<double, double>();
+			
 			public Dictionary<double, int> StrikeToTotalOI = new Dictionary<double, int>();
 		}
 
@@ -60,7 +69,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		{
 			public SharpDX.RectangleF Bounds;
 			public double Strike;
-			public double ValueGex;
+			public double Value; // Can be Net, Call, or Put based on mode
 			public int TotalOI;
 		}
 		#endregion
@@ -97,8 +106,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 		public string CsvFolderPath { get; set; }
 
 		[NinjaScriptProperty]
-		[Display(Name="Ticker Override", Description="Leave empty to auto-map (e.g. ES->SPX). Enter a ticker to force read (e.g. SPY).", Order=2, GroupName="Parameters")]
-		public string TickerOverride { get; set; }
+		[Display(Name="Display Mode", Description="Select Data View: Net (Calls-Puts), Calls Only, or Puts Only.", Order=2, GroupName="Parameters")]
+		public GexDisplayMode DisplayMode { get; set; }
 
 		[NinjaScriptProperty]
 		[Range(0, 100)]
@@ -109,11 +118,6 @@ namespace NinjaTrader.NinjaScript.Indicators
 		[Range(1, 120)]
 		[Display(Name="Max Data Age (Min)", Description="Stop plotting if CSV data is older than this to prevent staleness.", Order=4, GroupName="Parameters")]
 		public int MaxDataAgeMinutes { get; set; }
-
-		// NEW PARAMETER: Display Mode
-		[NinjaScriptProperty]
-		[Display(Name="Display Mode", Description="Choose which GEX to display: Net (Calls - Puts), Calls Only, or Puts Only.", Order=5, GroupName="Parameters")]
-		public GexDisplayMode DisplayMode { get; set; }
 		#endregion
 
 		protected override void OnStateChange()
@@ -130,10 +134,9 @@ namespace NinjaTrader.NinjaScript.Indicators
 				ScaleJustification							= NinjaTrader.Gui.Chart.ScaleJustification.Right;
 				
 				CsvFolderPath								= @"C:\Options_History_Data";
-				TickerOverride                              = ""; 
+				DisplayMode									= GexDisplayMode.NetGex;
 				CutoffPercent								= 2.0; 
 				MaxDataAgeMinutes							= 5;
-				DisplayMode                                 = GexDisplayMode.NetGEX; // Default to Net
 			}
 			else if (State == State.Configure)
 			{
@@ -184,10 +187,11 @@ namespace NinjaTrader.NinjaScript.Indicators
 			}
 		}
 
+		// === Automatic Ticker Mapper ===
 		private string GetMappedTicker()
 		{
-			if (!string.IsNullOrEmpty(TickerOverride))
-				return TickerOverride.Replace("^", "").Replace(".", "_");
+			if (Instrument == null || Instrument.MasterInstrument == null) 
+				return "SPX"; // Safety fallback
 
 			string instrName = Instrument.MasterInstrument.Name.ToUpper();
 
@@ -195,18 +199,18 @@ namespace NinjaTrader.NinjaScript.Indicators
 			{
 				case "ES":
 				case "MES":
-					return "SPX"; 
+					return "SPX"; // Maps to ^SPX in Python
 				case "NQ":
 				case "MNQ":
-					return "NDX"; 
+					return "NDX"; // Maps to ^NDX in Python
 				case "RTY":
 				case "M2K":
-					return "RUT"; 
+					return "RUT"; // Maps to ^RUT in Python
 				case "YM":
 				case "MYM":
-					return "DJI"; 
+					return "DJI"; // Maps to ^DJI in Python
 				default:
-					return instrName; 
+					return instrName; // E.g., SPY, AAPL
 			}
 		}
 
@@ -383,7 +387,9 @@ namespace NinjaTrader.NinjaScript.Indicators
 			{
 				double adjustedStrike = kvp.Key * basisRatio;
 				
-				double displayGex = 0.0;
+				double netGex = 0.0;
+				double callGex = 0.0;
+				double putGex = 0.0;
 				int totalOi = 0;
 
 				foreach (var opt in kvp.Value)
@@ -393,33 +399,33 @@ namespace NinjaTrader.NinjaScript.Indicators
 					double gamma = CalculateGamma(spotPrice, adjustedStrike, T, opt.IV);
 					double gex = gamma * opt.OI * 100.0;
 					
-					// Apply Selection Filter
-					if (opt.IsCall)
+					if (opt.IsCall) 
 					{
-						if (DisplayMode == GexDisplayMode.NetGEX || DisplayMode == GexDisplayMode.CallsOnly)
-						{
-							displayGex += gex;
-							totalOi += opt.OI;
-						}
+						netGex += gex;
+						callGex += gex;
 					}
-					else
+					else 
 					{
-						if (DisplayMode == GexDisplayMode.NetGEX || DisplayMode == GexDisplayMode.PutsOnly)
-						{
-							displayGex -= gex; // Puts stay negative (red) for visual consistency
-							totalOi += opt.OI;
-						}
+						netGex -= gex;
+						putGex -= gex; // Store Puts as negative value for consistency
 					}
+
+					totalOi += opt.OI;
 				}
 
-				if (barData.StrikeToGex.ContainsKey(adjustedStrike))
+				// Populate all 3 dictionaries
+				if (barData.StrikeToTotalOI.ContainsKey(adjustedStrike))
 				{
-					barData.StrikeToGex[adjustedStrike] += displayGex;
+					barData.StrikeToNetGex[adjustedStrike] += netGex;
+					barData.StrikeToCallGex[adjustedStrike] += callGex;
+					barData.StrikeToPutGex[adjustedStrike] += putGex;
 					barData.StrikeToTotalOI[adjustedStrike] += totalOi;
 				}
 				else
 				{
-					barData.StrikeToGex[adjustedStrike] = displayGex;
+					barData.StrikeToNetGex[adjustedStrike] = netGex;
+					barData.StrikeToCallGex[adjustedStrike] = callGex;
+					barData.StrikeToPutGex[adjustedStrike] = putGex;
 					barData.StrikeToTotalOI[adjustedStrike] = totalOi;
 				}
 			}
@@ -496,12 +502,19 @@ namespace NinjaTrader.NinjaScript.Indicators
 				}
 			}
 
+			// 1. Calculate Max GEX based on current Display Mode
 			for (int i = ChartBars.FromIndex; i <= ChartBars.ToIndex; i++)
 			{
 				if (!gexSeries.IsValidDataPointAt(i)) continue;
 				GexBarData data = gexSeries.GetValueAt(i);
 				if (data == null) continue;
-				foreach(var kvp in data.StrikeToGex)
+
+				Dictionary<double, double> targetDict = null;
+				if (DisplayMode == GexDisplayMode.CallGexOnly) targetDict = data.StrikeToCallGex;
+				else if (DisplayMode == GexDisplayMode.PutGexOnly) targetDict = data.StrikeToPutGex;
+				else targetDict = data.StrikeToNetGex;
+
+				foreach(var kvp in targetDict)
 				{
 					if (kvp.Key >= minPrice && kvp.Key <= maxPrice)
 						maxAbsGex = Math.Max(maxAbsGex, Math.Abs(kvp.Value));
@@ -530,14 +543,20 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 				float width = Math.Max(1f, x2 - x1);
 
-				foreach (var kvp in data.StrikeToGex)
+				// 2. Select the correct Dictionary to draw
+				Dictionary<double, double> drawDict = null;
+				if (DisplayMode == GexDisplayMode.CallGexOnly) drawDict = data.StrikeToCallGex;
+				else if (DisplayMode == GexDisplayMode.PutGexOnly) drawDict = data.StrikeToPutGex;
+				else drawDict = data.StrikeToNetGex;
+
+				foreach (var kvp in drawDict)
 				{
 					double strike = kvp.Key;
-					double gexVal = kvp.Value;
+					double val = kvp.Value;
 
 					if (strike > maxPrice + data.BarStrikeInterval || strike < minPrice - data.BarStrikeInterval) continue;
 
-					double gexRatio = Math.Abs(gexVal) / maxAbsGex;
+					double gexRatio = Math.Abs(val) / maxAbsGex;
 					if (gexRatio < (CutoffPercent / 100.0)) continue; 
 
 					float yTop = chartScale.GetYByValue(strike + (data.BarStrikeInterval / 2.0));
@@ -548,10 +567,12 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 					SharpDX.RectangleF rect = new SharpDX.RectangleF(x1, yDraw, width, height);
 					int brushIndex = Math.Max(0, Math.Min(255, (int)(gexRatio * 255)));
-					var brush = gexVal >= 0 ? positiveBrushes[brushIndex] : negativeBrushes[brushIndex];
+					
+					// 3. Select Color: Puts are Red, Calls are Blue. Net is both.
+					var brush = val >= 0 ? positiveBrushes[brushIndex] : negativeBrushes[brushIndex];
 
 					RenderTarget.FillRectangle(rect, brush);
-					frameHitList.Add(new GexHitInfo { Bounds = rect, Strike = strike, ValueGex = gexVal, TotalOI = data.StrikeToTotalOI[strike] });
+					frameHitList.Add(new GexHitInfo { Bounds = rect, Strike = strike, Value = val, TotalOI = data.StrikeToTotalOI[strike] });
 				}
 			}
 
@@ -563,11 +584,11 @@ namespace NinjaTrader.NinjaScript.Indicators
 		private void DrawTooltip(GexHitInfo info)
 		{
 			if (tooltipTextFormat == null || tooltipBgBrush == null) return;
-			
-			string modeLabel = DisplayMode == GexDisplayMode.CallsOnly ? "Call GEX" : 
-			                   DisplayMode == GexDisplayMode.PutsOnly ? "Put GEX" : "Net GEX";
+			string label = "Net GEX";
+			if (DisplayMode == GexDisplayMode.CallGexOnly) label = "Call GEX";
+			if (DisplayMode == GexDisplayMode.PutGexOnly) label = "Put GEX";
 
-			string text = string.Format("Total OI: {0:N0}\n{1}: {2:N2}", info.TotalOI, modeLabel, info.ValueGex);
+			string text = string.Format("Total OI: {0:N0}\n{1}: {2:N2}", info.TotalOI, label, info.Value);
 
 			using (var layout = new SharpDX.DirectWrite.TextLayout(NinjaTrader.Core.Globals.DirectWriteFactory, text, tooltipTextFormat, 250, 100))
 			{
@@ -605,4 +626,28 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 			if (ChartControl == null) return;
 			System.Windows.Point wpfPoint = e.GetPosition(ChartControl as System.Windows.IInputElement);
-			mousePosition = new SharpDX.Vector2((floa
+			mousePosition = new SharpDX.Vector2((float)wpfPoint.X, (float)wpfPoint.Y);
+
+			GexHitInfo found = hitTestList.LastOrDefault(hit => hit.Bounds.Contains(mousePosition));
+
+			if (found != null)
+			{
+				if (hoveredCell != found)
+				{
+					hoveredCell = found;
+					showTooltip = false;
+					hoverTimer.Stop();
+					hoverTimer.Start();
+				}
+			}
+			else if (hoveredCell != null)
+			{
+				hoveredCell = null;
+				showTooltip = false;
+				hoverTimer.Stop();
+				ChartControl.InvalidateVisual();
+			}
+		}
+		#endregion
+	}
+}
