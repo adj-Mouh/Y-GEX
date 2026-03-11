@@ -1,151 +1,124 @@
-# --- START OF FILE GEX Engine.py ---
-
-import yfinance as yf
 import pandas as pd
-import os
+import yfinance as yf
 import time
 from datetime import datetime
 import concurrent.futures
-import logging
+import os
 
-# --- 1. SETTINGS ---
-CONFIG = {
-    "TICKERS": ["^SPX", "^NDX", "^RUT", "SPY", "QQQ"], 
-    "BASIS_MAP": {
-        "^SPX": "ES=F",    
-        "SPY": "ES=F",     
-        "^NDX": "NQ=F",    
-        "QQQ": "NQ=F",     
-        "^RUT": "RTY=F",   
-        "IWM": "RTY=F",    
-        "^DJI": "YM=F",    
-        "DIA": "YM=F"      
-    },
-    "EXPIRATIONS_TO_PULL": 4,      
-    "INTERVAL_SECONDS": 60,        
-    "OUTPUT_DIR": r"C:\Options_History_Data", 
-    "SPOT_PRICE_RANGE_PERCENT": 0.10, 
-    "HOURS_TO_KEEP_FILES": 48 
-}
+# --- CONFIGURATION ---
+# List of tickers to scrape. C# will look for a CSV named after the ticker (e.g., SPX.csv)
+TICKERS_TO_SCRAPE = ["^SPX", "^NDX", "SPY"] 
 
-# --- 2. SETUP ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S')
+# Interval in seconds to re-fetch data from Yahoo Finance
+INTERVAL_SECONDS = 60
 
-if not os.path.exists(CONFIG["OUTPUT_DIR"]):
-    os.makedirs(CONFIG["OUTPUT_DIR"])
+# Directory to save the CSV files
+OUTPUT_DIR = "C:/NinjaTrader 8/gex_data" # IMPORTANT: Make sure this path exists and matches C#
 
-# --- 3. HELPER FUNCTIONS ---
-def get_live_vix():
+# --- ENGINE ---
+
+def fetch_and_save_data(ticker_symbol: str):
+    """
+    Fetches option chain data for a given ticker, enriches it with Volume and a Snapshot Spot Price,
+    and saves it to a CSV file.
+    """
     try:
-        vix_data = yf.Ticker("^VIX").history(period="1d", interval="1m")
-        if not vix_data.empty:
-            return float(vix_data['Close'].iloc[-1])
-    except Exception as e:
-        logging.error(f"Failed to fetch VIX: {e}")
-    return 15.0 # Fallback
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Fetching data for {ticker_symbol}...")
+        
+        ticker = yf.Ticker(ticker_symbol)
 
-def calculate_synced_basis(cash_ticker, future_ticker):
-    try:
-        tickers = f"{cash_ticker} {future_ticker}"
-        data = yf.download(tickers, period="5d", interval="1m", progress=False)['Close']
-        synced_data = data.dropna()
+        # 1. NEW: Get the LIVE spot price at the exact moment of the snapshot.
+        # This is CRITICAL for the "Sticky-Delta" calculation in C#.
+        history = ticker.history(period="1d", interval="1m")
+        snapshot_spot = history['Close'].iloc[-1] if not history.empty else 0
         
-        if synced_data.empty: return 1.0
+        if snapshot_spot == 0:
+            print(f"Warning: Could not fetch snapshot spot price for {ticker_symbol}. Skipping.")
+            return
 
-        last_sync_row = synced_data.iloc[-1]
-        cash_price, future_price = float(last_sync_row[cash_ticker]), float(last_sync_row[future_ticker])
-        
-        if cash_price == 0: return 1.0 
-        return future_price / cash_price
-    except Exception:
-        return 1.0 
+        # Fetch all available expiration dates
+        expirations = ticker.options
 
-# --- 4. WORKER FUNCTION ---
-def fetch_and_store_ticker(symbol, config, current_time, snapshot_vix):
-    try:
-        tk_yf = yf.Ticker(symbol)
-        
-        # 1. Fetch Spot Price & Basis
-        spot_price = tk_yf.history(period="1d", interval="1m")['Close'].iloc[-1]
-        basis_ratio = calculate_synced_basis(symbol, config["BASIS_MAP"][symbol]) if symbol in config["BASIS_MAP"] else 1.0
+        all_options_df = []
 
-        # 2. Fetch Options Data
-        expirations = tk_yf.options
-        if not expirations: return symbol, 404, "No options data found."
+        # Loop through expirations to build a complete chain (adjust as needed)
+        # For performance, you might limit this to the first few expirations
+        for exp in expirations[:5]: # Example: only fetch first 5 expirations
+            chain = ticker.option_chain(exp)
+            
+            # Combine calls and puts
+            calls = chain.calls
+            puts = chain.puts
+            calls['Type'] = 'Call'
+            puts['Type'] = 'Put'
+            
+            df = pd.concat([calls, puts])
+            all_options_df.append(df)
+            
+        if not all_options_df:
+            print(f"No options data found for {ticker_symbol}.")
+            return
 
-        all_options = []
-        for exp in expirations[:config["EXPIRATIONS_TO_PULL"]]:
-            try:
-                opt = tk_yf.option_chain(exp)
-                calls, puts = opt.calls.copy(), opt.puts.copy()
-                
-                if not calls.empty:
-                    calls['Type'], calls['Expiration'] = 'Call', exp
-                    all_options.append(calls)
-                if not puts.empty:
-                    puts['Type'], puts['Expiration'] = 'Put', exp
-                    all_options.append(puts)
-            except Exception:
-                continue
+        # Combine all expirations into one DataFrame
+        final_df = pd.concat(all_options_df)
 
-        if not all_options: return symbol, 204, "Chains were empty."
+        # 2. NEW: Clean Volume and Open Interest data to prevent C# errors.
+        final_df['volume'] = final_df['volume'].fillna(0)
+        final_df['openInterest'] = final_df['openInterest'].fillna(0)
+        final_df['impliedVolatility'] = final_df['impliedVolatility'].fillna(0)
 
-        # 3. Clean and Format
-        df = pd.concat(all_options, ignore_index=True)
-        min_strike = spot_price * (1 - config["SPOT_PRICE_RANGE_PERCENT"])
-        max_strike = spot_price * (1 + config["SPOT_PRICE_RANGE_PERCENT"])
-        df = df[(df['strike'] >= min_strike) & (df['strike'] <= max_strike)]
+        # 3. NEW: Inject the SnapshotSpot price into every row.
+        final_df['SnapshotSpot'] = snapshot_spot
         
-        df['openInterest'] = df['openInterest'].fillna(0).astype(int)
-        df['impliedVolatility'] = df['impliedVolatility'].fillna(0.0001)
-        df['Timestamp'] = current_time.strftime("%Y-%m-%d %H:%M:%S")
-        df['BasisRatio'] = round(basis_ratio, 6)
-        df['SnapshotVIX'] = round(snapshot_vix, 2)
+        # 4. Define the exact columns C# will expect.
+        # contractSymbol is useful for debugging but not needed for the math.
+        columns_to_export = [
+            'strike', 
+            'Type', 
+            'impliedVolatility', 
+            'openInterest', 
+            'volume', # NEW
+            'SnapshotSpot', # NEW
+            'lastTradeDate' # You'll parse this in C# to get TimeToExp
+        ]
         
-        # MUST MATCH C# PARSER EXACTLY
-        final_df = df[['Timestamp', 'Expiration', 'BasisRatio', 'SnapshotVIX', 'Type', 'strike', 'openInterest', 'impliedVolatility']]
+        export_df = final_df[columns_to_export]
         
-        clean_symbol = symbol.replace('^', '').replace('.', '_')
-        file_path = os.path.join(config["OUTPUT_DIR"], f"{clean_symbol}_Options_{current_time.strftime('%Y-%m-%d')}.csv")
+        # Rename columns to be simple and predictable for C#
+        export_df.columns = [
+            'Strike', 
+            'Type', 
+            'BaseIV', 
+            'OpenInterest', 
+            'Volume', 
+            'SnapshotSpot',
+            'LastTradeDate'
+        ]
+
+        # Save to a uniquely named CSV file
+        output_path = os.path.join(OUTPUT_DIR, f"{ticker_symbol.replace('^','')}.csv")
+        export_df.to_csv(output_path, index=False)
         
-        file_exists = os.path.isfile(file_path)
-        final_df.to_csv(file_path, mode='a', header=not file_exists, index=False)
-        
-        return symbol, 200, f"Appended {len(final_df)} strikes. VIX: {snapshot_vix:.2f}"
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Success! Data for {ticker_symbol} saved to {output_path}")
 
     except Exception as e:
-        return symbol, 500, f"Error: {e}"
+        print(f"An error occurred while fetching data for {ticker_symbol}: {e}")
 
-# --- 5. CLEANUP ---
-def cleanup_old_files(config):
-    if config["HOURS_TO_KEEP_FILES"] <= 0: return
-    try:
-        now, age_limit = time.time(), config["HOURS_TO_KEEP_FILES"] * 3600
-        for f in os.listdir(config["OUTPUT_DIR"]):
-            if f.endswith(".csv"):
-                p = os.path.join(config["OUTPUT_DIR"], f)
-                if os.stat(p).st_mtime < now - age_limit: os.remove(p)
-    except Exception: pass
-
-# --- 6. MAIN LOOP ---
-def run_parallel_fetcher(config):
-    logging.info(f"🚀 Starting Engine for: {', '.join(config['TICKERS'])}")
-    while True:
-        start_t, current_t = time.time(), datetime.now()
-        
-        # Get VIX Snapshot once per cycle to ensure perfectly synced baseline
-        snapshot_vix = get_live_vix()
-        
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(config['TICKERS'])) as executor:
-            futures = [executor.submit(fetch_and_store_ticker, tick, config, current_t, snapshot_vix) for tick in config['TICKERS']]
-            for future in concurrent.futures.as_completed(futures):
-                sym, status, msg = future.result()
-                if status == 200: logging.info(f"  ✅ {sym:<5} -> {msg}")
-                else: logging.warning(f"  ⚠️ {sym:<5} -> {msg}")
-
-        cleanup_old_files(config)
-        sleep_t = max(0, config["INTERVAL_SECONDS"] - (time.time() - start_t))
-        time.sleep(sleep_t)
 
 if __name__ == "__main__":
-    run_parallel_fetcher(CONFIG)
+    if not os.path.exists(OUTPUT_DIR):
+        print(f"Creating output directory: {OUTPUT_DIR}")
+        os.makedirs(OUTPUT_DIR)
+        
+    print("--- GEX Data Engine Started ---")
+    print(f"Scraping for tickers: {', '.join(TICKERS_TO_SCRAPE)}")
+    print(f"Data refresh interval: {INTERVAL_SECONDS} seconds")
+    
+    while True:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(TICKERS_TO_SCRAPE)) as executor:
+            # Map the fetching function to each ticker
+            executor.map(fetch_and_save_data, TICKERS_TO_SCRAPE)
+            
+        print(f"\nCycle complete. Waiting {INTERVAL_SECONDS} seconds for next fetch...\n")
+        time.sleep(INTERVAL_SECONDS)
+
