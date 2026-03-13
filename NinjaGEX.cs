@@ -8,6 +8,7 @@ using System.Windows.Input;
 using System.Windows.Media;
 using System.IO;
 using System.Globalization;
+using System.Threading.Tasks;
 using NinjaTrader.Cbi;
 using NinjaTrader.Gui;
 using NinjaTrader.Gui.Chart;
@@ -34,7 +35,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             public int OI;
             public double BaseIV;
             public int Volume; 
-            public double LastPrice; // HACK 3: Required for Put-Call Parity
+            public double LastPrice; // Kept for CSV compatibility, but no longer used for math
         }
 
         public class GexSnapshot
@@ -43,7 +44,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             public double BasisRatio;  
             public double SnapshotVIX; 
             public double SnapshotSpot; 
-            public double DividendYield; // HACK 4: Merton 'q' Variable
+            public double DividendYield; 
             public Dictionary<double, List<OptionData>> Strikes = new Dictionary<double, List<OptionData>>();
         }
 
@@ -56,14 +57,12 @@ namespace NinjaTrader.NinjaScript.Indicators
             public Dictionary<double, double> StrikeToCallGex = new Dictionary<double, double>();
             public Dictionary<double, double> StrikeToPutGex = new Dictionary<double, double>();
             
-            // UI Storage Metrics
             public Dictionary<double, int> StrikeToTotalOI = new Dictionary<double, int>();
             public Dictionary<double, int> StrikeToSyntheticOI = new Dictionary<double, int>();
             public Dictionary<double, double> StrikeToCallPrice = new Dictionary<double, double>();
             public Dictionary<double, double> StrikeToPutPrice = new Dictionary<double, double>();
             public Dictionary<double, double> StrikeToLiveIV = new Dictionary<double, double>();
             
-            // Secret Level Metrics
             public Dictionary<double, double> StrikeToVanna = new Dictionary<double, double>();
             public Dictionary<double, double> StrikeToCharm = new Dictionary<double, double>();
         }
@@ -81,12 +80,13 @@ namespace NinjaTrader.NinjaScript.Indicators
             public double LiveIV;
             public double Vanna;
             public double Charm;
-            public double ActiveSpot; // True implied spot
+            public double ActiveSpot; 
         }
         #endregion
 
         #region Variables
         private List<GexSnapshot> historicalSnapshots;
+        private readonly object dataLock = new object(); // Thread safety lock
         private Series<GexBarData> gexSeries;
         private bool isDataLoaded = false;
         private double activeImpliedSpot = 0.0;
@@ -176,8 +176,10 @@ namespace NinjaTrader.NinjaScript.Indicators
                 positiveBrushes = new SharpDX.Direct2D1.SolidColorBrush[256];
                 negativeBrushes = new SharpDX.Direct2D1.SolidColorBrush[256];
 
+                // Load initial data synchronously to ensure chart is ready
                 LoadGexDataFromCsv();
 
+                // Setup Async Timer to prevent NinjaTrader from freezing
                 fileCheckTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(5) };
                 fileCheckTimer.Tick += OnFileCheckTimerTick;
                 fileCheckTimer.Start();
@@ -195,24 +197,36 @@ namespace NinjaTrader.NinjaScript.Indicators
             return name;
         }
 
-        private void OnFileCheckTimerTick(object sender, EventArgs e)
+        private async void OnFileCheckTimerTick(object sender, EventArgs e)
         {
-            try
+            // Execute heavy I/O operations on a background thread
+            await Task.Run(() =>
             {
-                if (!Directory.Exists(CsvFolderPath)) return;
-                string[] files = Directory.GetFiles(CsvFolderPath, string.Format("*{0}*.csv", GetMappedTicker()));
-                bool hasNewData = false;
-                DateTime maxTime = lastFileReadTime;
-
-                foreach (string f in files)
+                try
                 {
-                    DateTime wt = File.GetLastWriteTime(f);
-                    if (wt > lastFileReadTime) { hasNewData = true; if (wt > maxTime) maxTime = wt; }
-                }
+                    if (!Directory.Exists(CsvFolderPath)) return;
+                    string[] files = Directory.GetFiles(CsvFolderPath, string.Format("*{0}*.csv", GetMappedTicker()));
+                    bool hasNewData = false;
+                    DateTime maxTime = lastFileReadTime;
 
-                if (hasNewData) { LoadGexDataFromCsv(); lastFileReadTime = maxTime; if (ChartControl != null) ChartControl.InvalidateVisual(); }
-            }
-            catch { }
+                    foreach (string f in files)
+                    {
+                        DateTime wt = File.GetLastWriteTime(f);
+                        if (wt > lastFileReadTime) { hasNewData = true; if (wt > maxTime) maxTime = wt; }
+                    }
+
+                    if (hasNewData) 
+                    { 
+                        LoadGexDataFromCsv(); 
+                        lastFileReadTime = maxTime; 
+                        
+                        // Safely request a UI redraw from the background thread
+                        if (ChartControl != null) 
+                            ChartControl.Dispatcher.InvokeAsync(() => ChartControl.InvalidateVisual());
+                    }
+                }
+                catch { }
+            });
         }
 
         private void LoadGexDataFromCsv()
@@ -223,13 +237,9 @@ namespace NinjaTrader.NinjaScript.Indicators
                 if (files.Length == 0) return;
 
                 Dictionary<DateTime, GexSnapshot> temp = new Dictionary<DateTime, GexSnapshot>();
-                DateTime maxTime = lastFileReadTime;
 
                 foreach (string file in files)
                 {
-                    DateTime wt = File.GetLastWriteTime(file);
-                    if (wt > maxTime) maxTime = wt;
-
                     using (FileStream fs = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
                     using (StreamReader sr = new StreamReader(fs))
                     {
@@ -238,7 +248,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                         while ((line = sr.ReadLine()) != null)
                         {
                             string[] c = line.Split(',');
-                            if (c.Length < 12) continue; // Expecting 12 columns now
+                            if (c.Length < 12) continue;
 
                             try 
                             {
@@ -267,9 +277,16 @@ namespace NinjaTrader.NinjaScript.Indicators
 
                 if (temp.Count > 0)
                 {
-                    historicalSnapshots = temp.Values.OrderBy(x => x.Timestamp).ToList();
-                    isDataLoaded = historicalSnapshots.Count > 0;
-                    lastFileReadTime = maxTime;
+                    lock (dataLock) // Thread-safe assignment
+                    {
+                        var sortedList = temp.Values.OrderBy(x => x.Timestamp).ToList();
+                        
+                        // MEMORY LEAK FIX: Keep only the last 24 hours of data
+                        sortedList.RemoveAll(x => (DateTime.UtcNow - x.Timestamp.ToUniversalTime()).TotalHours > 24);
+                        
+                        historicalSnapshots = sortedList;
+                        isDataLoaded = historicalSnapshots.Count > 0;
+                    }
                 }
             }
             catch { }
@@ -277,11 +294,14 @@ namespace NinjaTrader.NinjaScript.Indicators
 
         private GexSnapshot GetClosestSnapshot(DateTime t)
         {
-            if (historicalSnapshots == null || historicalSnapshots.Count == 0) return null;
-            int l = 0, r = historicalSnapshots.Count - 1;
-            GexSnapshot closest = null;
-            while (l <= r) { int m = l + (r - l) / 2; if (historicalSnapshots[m].Timestamp <= t) { closest = historicalSnapshots[m]; l = m + 1; } else r = m - 1; }
-            return closest;
+            lock (dataLock)
+            {
+                if (historicalSnapshots == null || historicalSnapshots.Count == 0) return null;
+                int l = 0, r = historicalSnapshots.Count - 1;
+                GexSnapshot closest = null;
+                while (l <= r) { int m = l + (r - l) / 2; if (historicalSnapshots[m].Timestamp <= t) { closest = historicalSnapshots[m]; l = m + 1; } else r = m - 1; }
+                return closest;
+            }
         }
 
         #region Black-Scholes-Merton (BSM) Math Engine
@@ -295,7 +315,6 @@ namespace NinjaTrader.NinjaScript.Indicators
             return 0.5 * (1.0 + sign * y);
         }
 
-        // BSM Delta
         private double CalculateDelta(double S, double K, double T, double v, bool isCall, double q, double r)
         {
             if (T <= 0 || v <= 0 || S <= 0 || K <= 0) return isCall ? (S > K ? 1 : 0) : (S < K ? -1 : 0);
@@ -303,7 +322,6 @@ namespace NinjaTrader.NinjaScript.Indicators
             return isCall ? Math.Exp(-q * T) * NormCDF(d1) : Math.Exp(-q * T) * (NormCDF(d1) - 1.0);
         }
 
-        // BSM Gamma
         private double CalculateGamma(double S, double K, double T, double v, double q, double r)
         {
             if (T <= 0 || v <= 0 || S <= 0 || K <= 0) return 0.0;
@@ -311,7 +329,6 @@ namespace NinjaTrader.NinjaScript.Indicators
             return (Math.Exp(-q * T) * NormPDF(d1)) / (S * v * Math.Sqrt(T));
         }
 
-        // BSM Vanna (dDelta / dVol)
         private double CalculateVanna(double S, double K, double T, double v, double q, double r)
         {
             if (T <= 0 || v <= 0 || S <= 0 || K <= 0) return 0.0;
@@ -320,7 +337,6 @@ namespace NinjaTrader.NinjaScript.Indicators
             return -Math.Exp(-q * T) * NormPDF(d1) * (d2 / v);
         }
 
-        // BSM Option Pricing
         private double CalculateOptionPrice(double S, double K, double T, double v, bool isCall, double q, double r)
         {
             if (T <= 0 || v <= 0 || S <= 0 || K <= 0) return Math.Max(0, isCall ? S - K : K - S); 
@@ -340,42 +356,16 @@ namespace NinjaTrader.NinjaScript.Indicators
 
             double basisRatio = snap.BasisRatio;
             double chartSpotPrice = Close[0]; 
+            
+            // --- REWRITTEN: HACK #1 (Futures Basis Implied Spot) ---
+            // NUKED the delayed Put-Call Parity logic. 
+            // We instantly derive the live native index spot using the live NinjaTrader 
+            // chart price and the options basis ratio, bypassing all delayed Yahoo premiums.
             double nativeSpotPrice = chartSpotPrice / basisRatio; 
+            activeImpliedSpot = nativeSpotPrice; 
             
             double q = snap.DividendYield;
             double r = 0.05; // Standard Risk-Free Rate
-
-            // --- SECRET HACK #1: Implied Forward Spot via Put-Call Parity ---
-            double closestStrike = snap.Strikes.Keys.OrderBy(k => Math.Abs(k - nativeSpotPrice)).FirstOrDefault();
-            double callLast = 0, putLast = 0, shortestT = 999.0;
-
-            if (closestStrike > 0 && snap.Strikes.ContainsKey(closestStrike))
-            {
-                foreach (var opt in snap.Strikes[closestStrike])
-                {
-                    double tEx = (opt.ExpirationUtc - Time[0].ToUniversalTime()).TotalDays / 365.0;
-                    if (tEx > 0.001 && tEx < shortestT) shortestT = tEx; // Find closest expiration
-                }
-                foreach (var opt in snap.Strikes[closestStrike])
-                {
-                    double tEx = (opt.ExpirationUtc - Time[0].ToUniversalTime()).TotalDays / 365.0;
-                    if (Math.Abs(tEx - shortestT) < 0.001)
-                    {
-                        if (opt.IsCall) callLast = opt.LastPrice;
-                        else putLast = opt.LastPrice;
-                    }
-                }
-            }
-
-            // Calculate true implied options market price
-            if (callLast > 0 && putLast > 0 && shortestT < 999.0)
-            {
-                double implied = (callLast - putLast + closestStrike * Math.Exp(-r * shortestT)) * Math.Exp(q * shortestT);
-                // Sanity check: Ensure it's not a garbage data spike (within 2% of native)
-                if (Math.Abs((implied / nativeSpotPrice) - 1.0) < 0.02) activeImpliedSpot = implied;
-                else activeImpliedSpot = nativeSpotPrice;
-            }
-            else activeImpliedSpot = nativeSpotPrice;
 
             // --- Sticky-Delta Price Move Calculation ---
             double safeSnapshotSpot = snap.SnapshotSpot > 0 ? snap.SnapshotSpot : activeImpliedSpot;
@@ -404,27 +394,23 @@ namespace NinjaTrader.NinjaScript.Indicators
                 foreach (var opt in kvp.Value)
                 {
                     double T = Math.Max(0.00001, (opt.ExpirationUtc - Time[0].ToUniversalTime()).TotalDays / 365.0);
-                    
                     int syntheticOI = opt.OI + (int)(opt.Volume * IntradayVolumeWeight);
                     
                     double shiftedIV = opt.BaseIV * (1.0 - (priceMovePercent * VolSkewFactor));
                     double finalLiveIV = Math.Max(0.01, shiftedIV * vixRatio); 
                     
-                    // --- THE MASTER EQUATIONS ---
                     double gamma = CalculateGamma(activeImpliedSpot, nativeStrike, T, finalLiveIV, q, r);
                     double vanna = CalculateVanna(activeImpliedSpot, nativeStrike, T, finalLiveIV, q, r);
                     double price = CalculateOptionPrice(activeImpliedSpot, nativeStrike, T, finalLiveIV, opt.IsCall, q, r);
                     
-                    // Secret Hack #2: Charm via 1-Day Finite Difference
                     double tTomorrow = Math.Max(0.00001, T - (1.0 / 365.0));
                     double deltaNow = CalculateDelta(activeImpliedSpot, nativeStrike, T, finalLiveIV, opt.IsCall, q, r);
                     double deltaTomorrow = CalculateDelta(activeImpliedSpot, nativeStrike, tTomorrow, finalLiveIV, opt.IsCall, q, r);
-                    double charm = deltaTomorrow - deltaNow; // Change in delta per 1 day decay
+                    double charm = deltaTomorrow - deltaNow; 
                     
-                    // Calculate True Dollar Exposures
                     double gex = gamma * syntheticOI * 100.0 * activeImpliedSpot; 
-                    double vannaEx = (vanna * 0.01) * syntheticOI * 100.0 * activeImpliedSpot; // Per 1% IV shift
-                    double charmEx = charm * syntheticOI * 100.0 * activeImpliedSpot; // Per 1 day decay
+                    double vannaEx = (vanna * 0.01) * syntheticOI * 100.0 * activeImpliedSpot; 
+                    double charmEx = charm * syntheticOI * 100.0 * activeImpliedSpot; 
                     
                     if (opt.IsCall) { netGex += gex; callGex += gex; netVanna += vannaEx; netCharm += charmEx; cPrice = Math.Max(cPrice, price); }
                     else { netGex -= gex; putGex -= gex; netVanna -= vannaEx; netCharm -= charmEx; pPrice = Math.Max(pPrice, price); }
@@ -537,7 +523,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 "God-Tier Options Engine (BSM)\n" +
                 "───────────────────────────────\n" +
                 "Strike Space:        {0:N0}\n" +
-                "Implied Fwd Spot:    {1:N2}\n" +
+                "Live Implied Spot:   {1:N2}\n" +
                 "Synthetic Live OI:   {2:N0}\n" +
                 "Sticky-Delta IV:     {3:P1}\n" +
                 "Est. Call Premium:   ${4:N2}\n" +
