@@ -22,18 +22,18 @@ def get_latest_price(ticker_symbol):
 
 def fetch_and_save_data(ticker_symbol: str):
     try:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Fetching Secret-Level data for {ticker_symbol}...")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Fetching Static Base data for {ticker_symbol}...")
         
         # 1. Base Metrics
         snapshot_spot = get_latest_price(ticker_symbol)
         snapshot_vix = get_latest_price("^VIX")
         
-        # Basis Ratio Proxy
+        # Basis Ratio Proxy (Critical for the C# live sync)
         futures_ticker = "ES=F" if ticker_symbol != "^NDX" else "NQ=F"
         futures_spot = get_latest_price(futures_ticker)
         basis_ratio = (futures_spot / snapshot_spot) if snapshot_spot > 0 else 1.0
 
-        # SECRET HACK 3: Get true continuous dividend yield (q)
+        # Dividend yield (q)
         try:
             spy_info = yf.Ticker("SPY").info
             div_yield = spy_info.get('dividendYield', spy_info.get('trailingAnnualDividendYield', 0.013))
@@ -63,7 +63,7 @@ def fetch_and_save_data(ticker_symbol: str):
         final_df['openInterest'] = final_df['openInterest'].fillna(0)
         final_df['volume'] = final_df['volume'].fillna(0)
         final_df['impliedVolatility'] = final_df['impliedVolatility'].fillna(0)
-        final_df['lastPrice'] = final_df['lastPrice'].fillna(0) # Needed for Put-Call Parity
+        final_df['lastPrice'] = final_df['lastPrice'].fillna(0) # Retained for formatting compatibility
         
         # Inject Unified Metrics
         final_df['Timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
