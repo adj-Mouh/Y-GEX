@@ -1,362 +1,128 @@
-#region Using declarations
-using System;
-using System.Collections.Generic;
-using System.ComponentModel.DataAnnotations;
-using System.Linq;
-using System.Windows.Media;
-using System.Net;
-using System.Net.Sockets;
-using System.Text;
-using System.Threading.Tasks;
-using NinjaTrader.Cbi;
-using NinjaTrader.Gui;
-using NinjaTrader.Gui.Chart;
-using NinjaTrader.Data;
-using NinjaTrader.NinjaScript;
-using NinjaTrader.NinjaScript.DrawingTools;
-using SharpDX.Direct2D1;
-#endregion
+import pandas as pd
+import yfinance as yf
+import time
+from datetime import datetime
+import socket
+import math
+import numpy as np
 
-public enum GexDisplayMode { NetGex, CallGexOnly, PutGexOnly }
+# --- CONFIGURATION ---
+TICKER = "^SPX"
+FUTURES_TICKER = "ES=F"
+VIX_TICKER = "^VIX"
+UDP_IP = "127.0.0.1"
+UDP_PORT = 9000
 
-namespace NinjaTrader.NinjaScript.Indicators
-{
-    public class GexHeatmapUDP : Indicator
-    {
-        #region Classes & Variables
-        public class OptionData
-        {
-            public double DTE; 
-            public bool IsCall;
-            public double Strike; 
-            public int OI;
-            public double BaseIV;
-            public int FlowDir; // 1 = Opening, -1 = Closing
-        }
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+history_state = {} # Stores previous price/vol to calculate PVOI flow
 
-        public class GexSnapshot
-        {
-            public double Timestamp; 
-            public double BasisRatio;  
-            public double SnapshotVIX; 
-            public double SnapshotSpot; 
-            public double CostOfCarry; 
-            public List<OptionData> Options = new List<OptionData>();
-        }
+def get_latest_price(symbol):
+    try:
+        t = yf.Ticker(symbol)
+        hist = t.history(period="1d", interval="1m")
+        return hist['Close'].iloc[-1] if not hist.empty else 0.0
+    except:
+        return 0.0
 
-        private UdpClient udpClient;
-        private Task udpTask;
-        private bool isListening = false;
-        private readonly object dataLock = new object();
+def calculate_implied_metrics(spot, calls, puts):
+    """ Hack: Put-Call Parity to find real implied Cost of Carry (r - q) """
+    try:
+        # Find ATM Strike
+        calls['abs_diff'] = abs(calls['strike'] - spot)
+        atm_strike = calls.loc[calls['abs_diff'].idxmin()]['strike']
         
-        private GexSnapshot latestSnapshot = null;
-        private Dictionary<double, double> StrikeNetGex = new Dictionary<double, double>();
+        atm_call = calls[calls['strike'] == atm_strike].iloc[0]['lastPrice']
+        atm_put = puts[puts['strike'] == atm_strike].iloc[0]['lastPrice']
         
-        // Pin Defense Memory
-        private HashSet<double> MajorGammaWalls = new HashSet<double>();
-        private Dictionary<double, int> IntradaySyntheticOI = new Dictionary<double, int>();
+        # C - P = S - K * e^(-rt). Rough approximation for cost of carry proxy
+        implied_forward = atm_strike + (atm_call - atm_put)
+        cost_of_carry = math.log(implied_forward / spot) if spot > 0 else 0.05
+        return cost_of_carry
+    except:
+        return 0.05 # Fallback to 5%
 
-        // Throttling State
-        private double lastCalcPrice = 0;
-        private DateTime lastCalcTime = DateTime.MinValue;
+def fetch_and_send_data(tier='fast'):
+    global history_state
+    try:
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Executing {tier.upper()} scan...")
+        
+        spot = get_latest_price(TICKER)
+        fut = get_latest_price(FUTURES_TICKER)
+        vix = get_latest_price(VIX_TICKER)
+        if spot == 0 or fut == 0: return
 
-        private SharpDX.Direct2D1.SolidColorBrush[] positiveBrushes; 
-        private SharpDX.Direct2D1.SolidColorBrush[] negativeBrushes; 
-        #endregion
+        basis_ratio = fut / spot
+        ticker = yf.Ticker(TICKER)
+        expirations = ticker.options
+        if not expirations: return
 
-        #region Parameters
-        [NinjaScriptProperty]
-        [Display(Name="Display Mode", Order=1, GroupName="1. Visuals")]
-        public GexDisplayMode DisplayMode { get; set; }
+        # Tiered Date Filtering
+        today = datetime.now()
+        selected_exps = []
+        for exp in expirations:
+            dte = (datetime.strptime(exp, '%Y-%m-%d') - today).days
+            if tier == 'fast' and dte <= 1: selected_exps.append(exp)
+            elif tier == 'medium' and 1 < dte <= 14: selected_exps.append(exp)
+            elif tier == 'slow' and dte > 14: selected_exps.append(exp)
 
-        [NinjaScriptProperty]
-        [Range(0, 100)]
-        [Display(Name="Filter Cutoff %", Order=2, GroupName="1. Visuals")]
-        public double CutoffPercent { get; set; }
+        all_opts = []
+        cost_of_carry = 0.05
 
-        [NinjaScriptProperty]
-        [Display(Name="UDP Port", Order=1, GroupName="2. System")]
-        public int UdpPort { get; set; } // <--- FIX: Removed the "= 9000;" from here
-        #endregion
+        for i, exp in enumerate(selected_exps):
+            chain = ticker.option_chain(exp)
+            if i == 0: cost_of_carry = calculate_implied_metrics(spot, chain.calls, chain.puts)
 
-        protected override void OnStateChange()
-        {
-            if (State == State.SetDefaults)
-            {
-                Description                 = "Institutional UDP GEX Engine with Microstructure Pin Defense.";
-                Name                        = "God-Tier UDP GEX";
-                Calculate                   = Calculate.OnEachTick; 
-                IsOverlay                   = true;
-                DrawOnPricePanel            = true;
+            for opt_type, df in [('1', chain.calls), ('0', chain.puts)]: # 1=Call, 0=Put
+                # Filter to +/- 10% of spot to keep UDP packet small and fast
+                df = df[(df['strike'] > spot * 0.9) & (df['strike'] < spot * 1.1)]
                 
-                // --- FIX: Initialize defaults here instead ---
-                CutoffPercent               = 2.0; 
-                UdpPort                     = 9000; 
-                DisplayMode                 = GexDisplayMode.NetGex;
-            }
-            else if (State == State.Configure)
-            {
-                ZOrder = -1; 
-                IntradaySyntheticOI.Clear();
-            }
-            else if (State == State.DataLoaded)
-            {
-                positiveBrushes = new SharpDX.Direct2D1.SolidColorBrush[256];
-                negativeBrushes = new SharpDX.Direct2D1.SolidColorBrush[256];
+                for _, row in df.iterrows():
+                    strike = row['strike']
+                    uid = f"{exp}_{opt_type}_{strike}"
+                    price = row['lastPrice']
+                    vol = row['volume'] if not np.isnan(row['volume']) else 0
+                    oi = row['openInterest'] if not np.isnan(row['openInterest']) else 0
+                    iv = row['impliedVolatility']
 
-                // Start Zero-Latency UDP Listener
-                isListening = true;
-                udpClient = new UdpClient(UdpPort);
-                udpTask = Task.Run(() => ReceiveUdpData());
-            }
-            else if (State == State.Terminated)
-            {
-                isListening = false;
-                if (udpClient != null) { udpClient.Close(); udpClient.Dispose(); }
-                DisposeBrushes();
-            }
-        }
-
-        #region UDP Telemetry System
-        private void ReceiveUdpData()
-        {
-            IPEndPoint remoteEP = new IPEndPoint(IPAddress.Any, UdpPort);
-            StringBuilder payloadBuilder = new StringBuilder();
-
-            while (isListening)
-            {
-                try
-                {
-                    byte[] data = udpClient.Receive(ref remoteEP);
-                    string chunk = Encoding.UTF8.GetString(data);
-                    payloadBuilder.Append(chunk);
-
-                    // If packet doesn't end cleanly or is small, process it
-                    if (chunk.Length < 50000) 
-                    {
-                        ProcessPayload(payloadBuilder.ToString());
-                        payloadBuilder.Clear();
-                    }
-                }
-                catch { /* Handle thread abort on termination */ }
-            }
-        }
-
-        private void ProcessPayload(string payload)
-        {
-            try
-            {
-                string[] parts = payload.Split('|');
-                if (parts.Length < 2) return;
-
-                string[] header = parts[0].Split(',');
-                GexSnapshot newSnap = new GexSnapshot
-                {
-                    Timestamp = double.Parse(header[0]),
-                    BasisRatio = double.Parse(header[1]),
-                    SnapshotVIX = double.Parse(header[2]),
-                    SnapshotSpot = double.Parse(header[3]),
-                    CostOfCarry = double.Parse(header[4])
-                };
-
-                for (int i = 1; i < parts.Length; i++)
-                {
-                    string[] row = parts[i].Split(',');
-                    if (row.Length < 6) continue;
-
-                    newSnap.Options.Add(new OptionData
-                    {
-                        DTE = double.Parse(row[0]),
-                        IsCall = row[1] == "1",
-                        Strike = double.Parse(row[2]),
-                        OI = (int)double.Parse(row[3]),
-                        BaseIV = double.Parse(row[4]),
-                        FlowDir = int.Parse(row[5])
-                    });
-                }
-
-                lock (dataLock) { latestSnapshot = newSnap; }
-                
-                // Force UI update
-                if (ChartControl != null)
-                    ChartControl.Dispatcher.InvokeAsync(() => ChartControl.InvalidateVisual());
-            }
-            catch { }
-        }
-        #endregion
-
-        #region Order Flow Imbalance (Pin Defense Hack)
-        protected override void OnMarketData(MarketDataEventArgs e)
-        {
-            if (e.MarketDataType == MarketDataType.Last && latestSnapshot != null)
-            {
-                double esPrice = e.Price;
-                double volume = e.Volume;
-
-                // Identify if transaction was on Bid or Ask
-                bool isAskHit = e.Price >= e.Ask;
-                bool isBidHit = e.Price <= e.Bid;
-                if (!isAskHit && !isBidHit) return;
-
-                lock (dataLock)
-                {
-                    // Hack: Microstructure Pin Defense. 
-                    // Dealers only hedge heavily when price collides with MAJOR Gamma Walls.
-                    foreach (double nativeStrike in MajorGammaWalls)
-                    {
-                        double chartStrike = nativeStrike * latestSnapshot.BasisRatio;
-                        
-                        // If ES is within 1 point of a massive Gamma wall, attribute tape to Dealer Flow
-                        if (Math.Abs(esPrice - chartStrike) <= 1.0)
-                        {
-                            int impliedContracts = (int)(volume * 5.0); // 1 ES ~ 5 SPX proxy
-                            
-                            if (!IntradaySyntheticOI.ContainsKey(nativeStrike))
-                                IntradaySyntheticOI[nativeStrike] = 0;
-
-                            // Buying at Ask increases OI, Selling at Bid decreases
-                            if (isAskHit) IntradaySyntheticOI[nativeStrike] += impliedContracts;
-                            if (isBidHit) IntradaySyntheticOI[nativeStrike] -= impliedContracts;
-                        }
-                    }
-                }
-            }
-        }
-        #endregion
-
-        #region Standard BSM Engine
-        private static double NormPDF(double x) { return Math.Exp(-x * x / 2.0) / Math.Sqrt(2.0 * Math.PI); }
-        private static double NormCDF(double x) {
-            int sign = x < 0 ? -1 : 1; x = Math.Abs(x) / Math.Sqrt(2.0);
-            double t = 1.0 / (1.0 + 0.3275911 * x);
-            double y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.Exp(-x * x);
-            return 0.5 * (1.0 + sign * y);
-        }
-        private double CalculateGamma(double S, double K, double T, double v, double q_and_r) {
-            if (T <= 0 || v <= 0 || S <= 0 || K <= 0) return 0.0;
-            // Using Put-Call parity inferred Cost of Carry (q_and_r)
-            double d1 = (Math.Log(S / K) + (q_and_r + v * v / 2.0) * T) / (v * Math.Sqrt(T)); 
-            return (Math.Exp(-q_and_r * T) * NormPDF(d1)) / (S * v * Math.Sqrt(T));
-        }
-        #endregion
-
-        protected override void OnBarUpdate()
-        {
-            if (CurrentBars[0] < 0 || latestSnapshot == null) return;
-
-            // --- Hack: Price-Delta Throttling ---
-            // Don't nuke the CPU if price barely moved or if we just updated 500ms ago
-            double liveEsPrice = Close[0];
-            if (Math.Abs(liveEsPrice - lastCalcPrice) < 0.5 && (DateTime.Now - lastCalcTime).TotalMilliseconds < 500)
-                return;
-
-            lastCalcPrice = liveEsPrice;
-            lastCalcTime = DateTime.Now;
-
-            GexSnapshot snap;
-            lock (dataLock) { snap = latestSnapshot; }
-
-            double basis = snap.BasisRatio;
-            double nativeSpot = liveEsPrice / basis;
-            double costOfCarry = snap.CostOfCarry;
-            
-            Dictionary<double, double> tempNetGex = new Dictionary<double, double>();
-            
-            // Re-calculate major gamma walls for Pin Defense
-            List<KeyValuePair<double, double>> ranker = new List<KeyValuePair<double, double>>();
-
-            foreach (var opt in snap.Options)
-            {
-                double chartStrike = opt.Strike * basis;
-                
-                // --- Hack: PVOI Flow Integration ---
-                // Python determined if flow was opening/closing based on Premium + Volume.
-                // Combine it with C# Tick order flow imbalance memory.
-                int c_sharp_oi_adjust = IntradaySyntheticOI.ContainsKey(opt.Strike) ? IntradaySyntheticOI[opt.Strike] : 0;
-                int python_pvoi_adjust = opt.FlowDir * (opt.OI / 100); // Exaggerate PVOI bias slightly
-                int syntheticOI = Math.Max(0, opt.OI + c_sharp_oi_adjust + python_pvoi_adjust);
-
-                // --- Hack: Sticky-Strike Volatility Surface ---
-                // As price drops, ATM IV increases. Shift IV synthetically.
-                double moneyness = nativeSpot / opt.Strike;
-                double stickyIV = opt.BaseIV * (1.0 + ((snap.SnapshotSpot - nativeSpot) / snap.SnapshotSpot) * 1.5);
-                stickyIV = Math.Max(0.01, stickyIV); // Floor
-
-                double gamma = CalculateGamma(nativeSpot, opt.Strike, opt.DTE, stickyIV, costOfCarry);
-                double gex = gamma * syntheticOI * 100.0 * nativeSpot;
-
-                if (!tempNetGex.ContainsKey(chartStrike)) tempNetGex[chartStrike] = 0;
-                
-                if (opt.IsCall) tempNetGex[chartStrike] += gex;
-                else tempNetGex[chartStrike] -= gex;
-            }
-
-            // Identify top 3 Gamma Walls for the Pin Defense loop
-            lock (dataLock)
-            {
-                StrikeNetGex = tempNetGex;
-                var sorted = tempNetGex.OrderByDescending(x => Math.Abs(x.Value)).Take(3);
-                MajorGammaWalls.Clear();
-                foreach (var s in sorted) MajorGammaWalls.Add(s.Key / basis);
-            }
-        }
-
-        #region Hardware-Accelerated Rendering
-        public override void OnRenderTargetChanged()
-        {
-            DisposeBrushes();
-            if (RenderTarget != null)
-            {
-                for (int i = 0; i < 256; i++)
-                {
-                    System.Windows.Media.Color pc = System.Windows.Media.Color.FromRgb((byte)(10+(0-10)*(i/255.0)), (byte)(20+(200-20)*(i/255.0)), (byte)(40+(255-40)*(i/255.0)));
-                    positiveBrushes[i] = new SharpDX.Direct2D1.SolidColorBrush(RenderTarget, new SharpDX.Color(pc.R, pc.G, pc.B)) { Opacity = 0.65f };
+                    # PVOI Directionality Hack
+                    flow_dir = 0
+                    if uid in history_state:
+                        prev_price, prev_vol = history_state[uid]
+                        if vol > prev_vol:
+                            if price > prev_price: flow_dir = 1   # Buying pressure (Opening)
+                            elif price < prev_price: flow_dir = -1 # Selling pressure (Closing)
                     
-                    System.Windows.Media.Color nc = System.Windows.Media.Color.FromRgb((byte)(40+(255-40)*(i/255.0)), (byte)(10+(100-10)*(i/255.0)), (byte)(10+(0-10)*(i/255.0)));
-                    negativeBrushes[i] = new SharpDX.Direct2D1.SolidColorBrush(RenderTarget, new SharpDX.Color(nc.R, nc.G, nc.B)) { Opacity = 0.65f };
-                }
-            }
-        }
+                    history_state[uid] = (price, vol)
+                    dte = max(0.001, (datetime.strptime(exp, '%Y-%m-%d') - today).days / 365.0)
+                    
+                    # Format: DTE, IsCall, Strike, OI, IV, FlowDir
+                    all_opts.append(f"{dte:.4f},{opt_type},{strike},{oi},{iv:.4f},{flow_dir}")
 
-        private void DisposeBrushes()
-        {
-            if (positiveBrushes != null) for (int i = 0; i < 256; i++) { if (positiveBrushes[i] != null) positiveBrushes[i].Dispose(); if (negativeBrushes[i] != null) negativeBrushes[i].Dispose(); }
-        }
+        if not all_opts: return
 
-        protected override void OnRender(ChartControl cc, ChartScale cs)
-        {
-            if (Bars == null || positiveBrushes == null || positiveBrushes[0] == null) return;
+        # Header Format: Timestamp|BasisRatio|VIX|Spot|CostOfCarry
+        header = f"{datetime.now().timestamp()},{basis_ratio:.6f},{vix:.4f},{spot:.2f},{cost_of_carry:.4f}"
+        
+        # Combine and send via UDP
+        payload = header + "|" + "|".join(all_opts)
+        
+        # Chunking if payload is too large for single UDP datagram (> 60KB)
+        chunk_size = 50000 
+        for i in range(0, len(payload), chunk_size):
+            sock.sendto(payload[i:i+chunk_size].encode(), (UDP_IP, UDP_PORT))
             
-            Dictionary<double, double> renderGex;
-            lock(dataLock) { renderGex = new Dictionary<double, double>(StrikeNetGex); }
-            if (renderGex.Count == 0) return;
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] UDP Packet Sent! ({len(all_opts)} strikes)")
 
-            RenderTarget.AntialiasMode = SharpDX.Direct2D1.AntialiasMode.Aliased;
+    except Exception as e:
+        print(f"Error: {e}")
 
-            double minP = cs.MinValue, maxP = cs.MaxValue;
-            double maxGex = renderGex.Values.Select(Math.Abs).DefaultIfEmpty(0.0001).Max();
-
-            float x1 = cc.CanvasLeft;
-            float x2 = cc.CanvasRight;
-            float w = x2 - x1;
-
-            foreach (var kvp in renderGex)
-            {
-                if (kvp.Key > maxP + 10 || kvp.Key < minP - 10) continue;
-                
-                double ratio = Math.Abs(kvp.Value) / maxGex;
-                if (ratio < (CutoffPercent / 100.0)) continue; 
-
-                // Strike block height based roughly on typical SPX interval mapped to ES
-                float yt = cs.GetYByValue(kvp.Key + 2.5);
-                float yb = cs.GetYByValue(kvp.Key - 2.5);
-                
-                SharpDX.RectangleF rect = new SharpDX.RectangleF(x1, Math.Min(yt, yb), w, Math.Abs(yb - yt));
-                int colorIndex = Math.Max(0, Math.Min(255, (int)(ratio * 255)));
-                
-                RenderTarget.FillRectangle(rect, kvp.Value >= 0 ? positiveBrushes[colorIndex] : negativeBrushes[colorIndex]);
-            }
-        }
-        #endregion
-    }
-}
+if __name__ == "__main__":
+    print("--- Institutional UDP GEX Engine Started ---")
+    loop_count = 0
+    while True:
+        fetch_and_send_data('fast') # Every 1 minute
+        if loop_count % 5 == 0: fetch_and_send_data('medium') # Every 5 minutes
+        if loop_count % 60 == 0: fetch_and_send_data('slow') # Every 60 minutes
+        
+        loop_count += 1
+        time.sleep(60)
