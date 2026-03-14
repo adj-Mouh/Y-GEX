@@ -6,7 +6,7 @@ using System.Text;
 using System.Threading.Tasks;
 using System.Windows.Media;
 
-// Standard NinjaTrader 8 namespaces
+// Standard NinjaTrader 8 Namespaces
 using NinjaTrader.Cbi;
 using NinjaTrader.Gui;
 using NinjaTrader.Gui.Chart;
@@ -16,8 +16,8 @@ using NinjaTrader.NinjaScript.DrawingTools;
 
 namespace NinjaTrader.NinjaScript.Indicators
 {
-    // IMPORTANT: The class name MUST match your file name (MyCustomIndicator2)
-    public class MyCustomIndicator2 : Indicator
+    // Make sure the class name matches your file name (e.g., NinjaGEX_Final)
+    public class NinjaGEX_Final : Indicator
     {
         // --- UDP & Data State ---
         private UdpClient udpServer;
@@ -37,12 +37,11 @@ namespace NinjaTrader.NinjaScript.Indicators
         {
             if (State == State.SetDefaults)
             {
-                Description = "Advanced Synthetic GEX with OI Gravity and UDP Data";
-                Name = "MyCustomIndicator2"; // Update this name to match as well
+                Description = "Final Synthetic GEX with OI Gravity and UDP Data";
+                Name = "NinjaGEX Final";
                 Calculate = Calculate.OnEachTick; 
                 IsOverlay = true;
             }
-
             else if (State == State.DataLoaded)
             {
                 StartUdpListener();
@@ -70,7 +69,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                         string message = Encoding.UTF8.GetString(data);
                         ParseUdpMessage(message);
                     }
-                    catch { /* Handle thread aborts cleanly */ }
+                    catch { /* Catches exceptions on thread abort/shutdown */ }
                 }
             });
         }
@@ -100,8 +99,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 
         protected override void OnMarketData(MarketDataEventArgs marketDataUpdate)
         {
-            // The Hack: Tick Rule (Lee-Ready Approximation)
-            // Determine if the live futures trade was aggressive buying or selling
+            // THE TICK RULE: Determine if the live futures trade was aggressive buying or selling
             if (marketDataUpdate.MarketDataType == MarketDataType.Last)
             {
                 double price = marketDataUpdate.Price;
@@ -118,13 +116,13 @@ namespace NinjaTrader.NinjaScript.Indicators
         {
             if (CurrentBar < 20 || optionsChain.IsEmpty) return;
 
-            // Hack: Throttle the heavy math. Only calculate every 5 seconds.
+            // THROTTLING HACK: Only run heavy calculations every 5 seconds to save CPU
             if ((DateTime.Now - lastCalculationTime).TotalSeconds >= 5)
             {
                 DistributeSyntheticFlow(Close[0]);
                 RenderHeatmap(Close[0]);
                 
-                // Reset accumulators
+                // Reset accumulators for the next interval
                 accumulatedAggressiveBuyVol = 0;
                 accumulatedAggressiveSellVol = 0;
                 lastCalculationTime = DateTime.Now;
@@ -133,47 +131,50 @@ namespace NinjaTrader.NinjaScript.Indicators
 
         private void DistributeSyntheticFlow(double currentSpot)
         {
-            // Hack: OI Gravity. Distribute volume based on existing baseline OI, not blindly.
+            // THE OI GRAVITY HACK: Distribute volume based on existing baseline OI, not blindly.
             double totalNearbyOI = 0.0;
-            double radius = 50.0; // Distribute flow to strikes within 50 points
+            double radius = 50.0; // Affect strikes within 50 points of spot
 
+            // 1. Calculate the total OI in the immediate vicinity of the spot price
             foreach (var kvp in optionsChain)
             {
                 if (Math.Abs(kvp.Key - currentSpot) <= radius)
                     totalNearbyOI += (kvp.Value.BaseCallOI + kvp.Value.BasePutOI);
             }
 
-            if (totalNearbyOI == 0) return;
-
-            foreach (var kvp in optionsChain)
+            // 2. Distribute the accumulated flow, weighted by each strike's share of that total OI
+            if (totalNearbyOI > 0) // Prevent division by zero
             {
-                double strike = kvp.Key;
-                if (Math.Abs(strike - currentSpot) <= radius)
+                foreach (var kvp in optionsChain)
                 {
-                    var level = kvp.Value;
-                    double weight = (level.BaseCallOI + level.BasePutOI) / totalNearbyOI;
+                    double strike = kvp.Key;
+                    if (Math.Abs(strike - currentSpot) <= radius)
+                    {
+                        var level = kvp.Value;
+                        double weight = (level.BaseCallOI + level.BasePutOI) / totalNearbyOI;
 
-                    // Apply flow: Aggressive Buy = Dealers Short Calls = Negative GEX
-                    level.SyntheticCallFlow += (accumulatedAggressiveBuyVol * weight);
-                    level.SyntheticPutFlow += (accumulatedAggressiveSellVol * weight);
-                    
-                    optionsChain[strike] = level;
+                        // Aggressive Buys -> Customers buy Calls, Dealers SHORT Calls
+                        level.SyntheticCallFlow += (accumulatedAggressiveBuyVol * weight);
+                        // Aggressive Sells -> Customers buy Puts, Dealers SHORT Puts
+                        level.SyntheticPutFlow += (accumulatedAggressiveSellVol * weight);
+                        
+                        optionsChain[strike] = level;
+                    }
                 }
             }
         }
 
         private void RenderHeatmap(double spotPrice)
         {
-            // Calculate time to close (assuming 4:00 PM EST close)
             DateTime now = DateTime.Now;
-            DateTime closeTime = new DateTime(now.Year, now.Month, now.Day, 16, 0, 0);
+            DateTime closeTime = new DateTime(now.Year, now.Month, now.Day, 16, 0, 0); // Assuming 4 PM EST market close
             double daysToExpiry = (closeTime - now).TotalDays;
 
-            // HACK: Floor Time to Expiry at ~30 minutes to prevent Gamma Explosion (Infinity)
+            // GAMMA EXPLOSION FIX: Floor Time to Expiry at ~30 minutes
             double T = Math.Max(0.00034, daysToExpiry); 
 
-            // HACK: Use live VIX1D to scale the baseline IV dynamically
-            double volScaler = currentVix1D / 15.0; 
+            // DYNAMIC IV: Use live VIX1D to scale the baseline IV dynamically
+            double volScaler = currentVix1D / 15.0; // Normalize against a baseline VIX of 15
 
             foreach (var kvp in optionsChain)
             {
@@ -186,38 +187,40 @@ namespace NinjaTrader.NinjaScript.Indicators
                 double callIV = Math.Max(0.01, data.CallIV * volScaler);
                 double putIV = Math.Max(0.01, data.PutIV * volScaler);
 
-                // Calculate Gamma using floored T
+                // Calculate Gamma using the safe, floored Time (T)
                 double callGamma = CalculateGamma(spotPrice, strike, T, callIV, riskFreeRate);
                 double putGamma = CalculateGamma(spotPrice, strike, T, putIV, riskFreeRate);
 
-                // Dealers short calls sold to clients (Negative GEX)
                 double totalCallOI = data.BaseCallOI + data.SyntheticCallFlow; 
                 double totalPutOI = data.BasePutOI + data.SyntheticPutFlow;
 
-                // Standard GEX Formula: Gamma * OI * 100 * Spot Price
+                // Dealers are short calls sold to clients (Negative GEX) & short puts sold to clients (Positive GEX)
+                // GEX = (Call Gamma * -Call OI) + (Put Gamma * -Put OI)
+                // But since dealers are net short puts, this becomes positive exposure for the street.
+                // Simplified view: Net GEX = (Put GEX) - (Call GEX)
                 double callGEX = callGamma * totalCallOI * 100 * spotPrice;
-                double putGEX = putGamma * totalPutOI * 100 * spotPrice; // Put Gamma is natively positive here, so we subtract it for Net GEX
+                double putGEX = putGamma * totalPutOI * 100 * spotPrice;
+                double netGEX = putGEX - callGEX; // Positive Net GEX = Pinning force, Negative Net GEX = Accelerant
 
-                double netGEX = callGEX - putGEX;
+                // --- CORRECTED DRAWING LOGIC ---
+                Brush gexColor = netGEX > 0 ? Brushes.RoyalBlue : Brushes.OrangeRed;
+                // Convert the width into a whole number of bars (int) for the X-axis
+                int barsWidth = Math.Max(1, (int)(Math.Abs(netGEX) / 10000000.0)); // Adjust divisor to scale width
 
-                // --- Drawing Logic (Using simplified NinjaTrader drawing) ---
-                Brush gexColor = netGEX > 0 ? Brushes.Blue : Brushes.Orange;
-
-				int barsWidth = Math.Max(1, (int)(Math.Abs(netGEX) / 1000000.0));
-
-				Draw.Rectangle(this, "GEX_" + strike.ToString(), false, barsWidth, strike + 1, 0, strike - 1, Brushes.Transparent, gexColor, 50);
-
+                Draw.Rectangle(this, "GEX_" + strike.ToString(), false, barsWidth, strike + 1, 0, strike - 1, Brushes.Transparent, gexColor, 70);
             }
         }
 
         // --- Black-Scholes Math Helper ---
         private double CalculateGamma(double S, double K, double T, double v, double r)
         {
+            if (v <= 0 || T <= 0) return 0; // Guard against invalid inputs
             double d1 = (Math.Log(S / K) + (r + v * v / 2.0) * T) / (v * Math.Sqrt(T));
             double pdf_d1 = Math.Exp(-0.5 * d1 * d1) / Math.Sqrt(2 * Math.PI);
-            return pdf_d1 / (S * v * Math.Sqrt(T)); // With T floored, this never divides by zero
+            return pdf_d1 / (S * v * Math.Sqrt(T));
         }
 
+        // Helper class to store all data for a single strike price
         public class OptionLevel
         {
             public double BaseCallOI { get; set; }
