@@ -1,96 +1,69 @@
-import pandas as pd
 import yfinance as yf
 import time
+import socket
+import threading
 from datetime import datetime
-import concurrent.futures
-import os
-import warnings
-warnings.filterwarnings("ignore") 
 
 # --- CONFIGURATION ---
-TICKERS_TO_SCRAPE = ["^SPX", "^NDX", "SPY"] 
-OUTPUT_DIR = r"C:\Options_History_Data" 
-INTERVAL_SECONDS = 60
+TICKER = "^SPX"
+VIX_TICKER = "^VIX1D"
+UDP_IP = "127.0.0.1"
+UDP_PORT = 11000
+REFRESH_INTERVAL_VIX = 60  # Fetch VIX1D every 60 seconds
 
-def get_latest_price(ticker_symbol):
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+def fetch_baseline_options():
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Fetching baseline OI for {TICKER}...")
     try:
-        t = yf.Ticker(ticker_symbol)
-        hist = t.history(period="5d", interval="1m")
-        return hist['Close'].iloc[-1] if not hist.empty else 0.0
-    except:
-        return 0.0
-
-def fetch_and_save_data(ticker_symbol: str):
-    try:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Fetching Static Base data for {ticker_symbol}...")
+        spx = yf.Ticker(TICKER)
+        expirations = spx.options
+        if not expirations:
+            return
         
-        # 1. Base Metrics
-        snapshot_spot = get_latest_price(ticker_symbol)
-        snapshot_vix = get_latest_price("^VIX")
+        # Fetch 0DTE (first expiration)
+        opt_chain = spx.option_chain(expirations[0])
+        calls = opt_chain.calls
+        puts = opt_chain.puts
         
-        # Basis Ratio Proxy (Critical for the C# live sync)
-        futures_ticker = "ES=F" if ticker_symbol != "^NDX" else "NQ=F"
-        futures_spot = get_latest_price(futures_ticker)
-        basis_ratio = (futures_spot / snapshot_spot) if snapshot_spot > 0 else 1.0
-
-        # Dividend yield (q)
-        try:
-            spy_info = yf.Ticker("SPY").info
-            div_yield = spy_info.get('dividendYield', spy_info.get('trailingAnnualDividendYield', 0.013))
-            if div_yield is None: div_yield = 0.013
-        except:
-            div_yield = 0.013
-
-        if snapshot_spot == 0: return
-
-        ticker = yf.Ticker(ticker_symbol)
-        expirations = ticker.options
-        if not expirations: return
-
-        all_options_df = []
-        for exp in expirations[:5]:
-            chain = ticker.option_chain(exp)
-            calls, puts = chain.calls, chain.puts
-            calls['Type'] = 'Call'
-            puts['Type'] = 'Put'
-            calls['Expiration'] = exp
-            puts['Expiration'] = exp
-            all_options_df.append(pd.concat([calls, puts]))
-
-        final_df = pd.concat(all_options_df)
-
-        # Clean NaN values
-        final_df['openInterest'] = final_df['openInterest'].fillna(0)
-        final_df['volume'] = final_df['volume'].fillna(0)
-        final_df['impliedVolatility'] = final_df['impliedVolatility'].fillna(0)
-        final_df['lastPrice'] = final_df['lastPrice'].fillna(0) # Retained for formatting compatibility
+        # Format: OPT|Strike|CallOI|PutOI|CallIV|PutIV
+        for index, row in calls.iterrows():
+            strike = row['strike']
+            call_oi = row['openInterest'] if not type(row['openInterest']) == float else 0
+            call_iv = row['impliedVolatility']
+            
+            # Find matching put
+            put_match = puts[puts['strike'] == strike]
+            put_oi = put_match['openInterest'].values[0] if not put_match.empty else 0
+            put_iv = put_match['impliedVolatility'].values[0] if not put_match.empty else 0
+            
+            msg = f"OPT|{strike}|{call_oi}|{put_oi}|{call_iv}|{put_iv}"
+            sock.sendto(msg.encode('utf-8'), (UDP_IP, UDP_PORT))
+            
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Baseline Options Data Sent via UDP.")
         
-        # Inject Unified Metrics
-        final_df['Timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        final_df['BasisRatio'] = round(basis_ratio, 6)
-        final_df['SnapshotVIX'] = round(snapshot_vix, 4)
-        final_df['SnapshotSpot'] = round(snapshot_spot, 2)
-        final_df['DividendYield'] = round(div_yield, 4)
-
-        # Export EXACTLY 12 columns for C# Engine
-        export_df = final_df[[
-            'Timestamp', 'Expiration', 'BasisRatio', 'SnapshotVIX', 
-            'Type', 'strike', 'openInterest', 'impliedVolatility', 
-            'volume', 'SnapshotSpot', 'DividendYield', 'lastPrice'
-        ]]
-
-        output_path = os.path.join(OUTPUT_DIR, f"{ticker_symbol.replace('^','')}.csv")
-        export_df.to_csv(output_path, index=False, header=True)
-        
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Success! Saved {len(export_df)} strikes.")
-
     except Exception as e:
-        print(f"Error fetching {ticker_symbol}: {e}")
+        print(f"Error fetching options: {e}")
+
+def fetch_live_vix():
+    while True:
+        try:
+            vix = yf.Ticker(VIX_TICKER)
+            hist = vix.history(period="1d", interval="1m")
+            if not hist.empty:
+                last_vix = hist['Close'].iloc[-1]
+                msg = f"VIX|{last_vix}"
+                sock.sendto(msg.encode('utf-8'), (UDP_IP, UDP_PORT))
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Sent VIX1D Update: {last_vix}")
+        except Exception as e:
+            print(f"Error fetching VIX1D: {e}")
+            
+        time.sleep(REFRESH_INTERVAL_VIX)
 
 if __name__ == "__main__":
-    if not os.path.exists(OUTPUT_DIR): os.makedirs(OUTPUT_DIR)
-    print("--- Institutional GEX Data Engine Started ---")
-    while True:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(TICKERS_TO_SCRAPE)) as executor:
-            executor.map(fetch_and_save_data, TICKERS_TO_SCRAPE)
-        time.sleep(INTERVAL_SECONDS)
+    print("Starting Synthetic GEX Data Server...")
+    # 1. Send Baseline
+    fetch_baseline_options()
+    
+    # 2. Start VIX1D loop in main thread
+    fetch_live_vix()
