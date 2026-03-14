@@ -15,7 +15,7 @@ using NinjaTrader.Gui;
 using NinjaTrader.Gui.Chart;
 using NinjaTrader.Data;
 using NinjaTrader.NinjaScript;
-using NinjaTrader.NinjaScript.DrawingTools; // <-- ADDED THIS LINE
+using NinjaTrader.NinjaScript.DrawingTools; // Required for Draw.TextFixed
 using System.Windows.Threading;
 using SharpDX.Direct2D1;
 using SharpDX.DirectWrite;
@@ -46,6 +46,13 @@ namespace NinjaTrader.NinjaScript.Indicators
             public double SnapshotSpot; 
             public double DividendYield; 
             public Dictionary<double, List<OptionData>> Strikes = new Dictionary<double, List<OptionData>>();
+        }
+
+        // --- THE JEDI HACKS: Flow Data Container ---
+        public class FlowData
+        {
+            public double CallVolume = 0;
+            public double PutVolume = 0;
         }
 
         public class GexBarData
@@ -88,8 +95,8 @@ namespace NinjaTrader.NinjaScript.Indicators
         private double activeImpliedSpot = 0.0;
         private GexSnapshot latestSnapshot = null;
 
-        // --- THE JEDI HACK: Live Dealer Flow Tracking ---
-        private ConcurrentDictionary<double, double> impliedDealerFlow = new ConcurrentDictionary<double, double>();
+        // Thread-safe dictionary to hold separated Call and Put live order flow
+        private ConcurrentDictionary<double, FlowData> impliedDealerFlow = new ConcurrentDictionary<double, FlowData>();
         private bool isTickReplayChecked = false;
 
         private SharpDX.Direct2D1.SolidColorBrush[] positiveBrushes; 
@@ -149,9 +156,9 @@ namespace NinjaTrader.NinjaScript.Indicators
         {
             if (State == State.SetDefaults)
             {
-                Description                 = "Live 0DTE Order Flow GEX Map via Futures Volume Extrapolation.";
+                Description                 = "Institutional Synthetic Microstructure Engine. (Live 0DTE GEX).";
                 Name                        = "God-Tier 0DTE GEX";
-                Calculate                   = Calculate.OnEachTick; // Required for OnMarketData
+                Calculate                   = Calculate.OnEachTick; // Required for OnMarketData order flow
                 IsOverlay                   = true;
                 DrawOnPricePanel            = true;
                 
@@ -161,8 +168,8 @@ namespace NinjaTrader.NinjaScript.Indicators
                 CutoffPercent               = 2.0; 
                 VolSkewFactor               = 1.5;  
                 
-                FuturesToOptionsMultiplier  = 5.0; // 1 ES ~ 5 SPX options
-                StrikeProximityZone         = 10.0; // +/- 10 points bell curve
+                FuturesToOptionsMultiplier  = 5.0; // Standard ratio (1 ES roughly hedges 5 SPX options)
+                StrikeProximityZone         = 10.0; // Bell curve spread
             }
             else if (State == State.Configure)
             {
@@ -189,9 +196,9 @@ namespace NinjaTrader.NinjaScript.Indicators
             else if (State == State.Terminated) { if (ChartControl != null && isMouseSubscribed) ChartControl.MouseMove -= OnChartMouseMove; DisposeBrushes(); }
         }
 
-        private string GetMappedTicker() { return "SPX"; } // Simplified for futures mapping
+        private string GetMappedTicker() { return "SPX"; } 
 
-        #region Live Tick Data Integration (The Jedi Hack)
+        #region Live Tick Data Integration (Hack #1: Delta Directionality)
         protected override void OnMarketData(MarketDataEventArgs e)
         {
             if (e.MarketDataType == MarketDataType.Last)
@@ -201,7 +208,11 @@ namespace NinjaTrader.NinjaScript.Indicators
                 double nativeSpot = e.Price / latestSnapshot.BasisRatio;
                 double tickVolume = e.Volume;
 
-                // Fast O(1) Localized Loop: We only check strikes within 15 points of the trade
+                // --- HACK 1: Bypassing Call vs Put Duplication (Delta Split) ---
+                bool isAskHit = e.Price >= e.Ask;
+                bool isBidHit = e.Price <= e.Bid;
+                if (!isAskHit && !isBidHit) return; // Ignore mid-market trades
+
                 double roundedSpot = Math.Round(nativeSpot / 5.0) * 5.0;
 
                 for (double offset = -15.0; offset <= 15.0; offset += 5.0)
@@ -211,18 +222,27 @@ namespace NinjaTrader.NinjaScript.Indicators
 
                     if (distance <= StrikeProximityZone)
                     {
-                        // Gaussian distribution: Max weight if exactly on strike, tapers off as price moves away
+                        // Gaussian distribution allocation
                         double weight = Math.Exp(-Math.Pow(distance / (StrikeProximityZone / 2.0), 2) / 2.0);
                         double impliedContracts = tickVolume * weight * FuturesToOptionsMultiplier;
 
-                        // Safely inject into thread-safe dictionary
-                        impliedDealerFlow.AddOrUpdate(targetStrike, impliedContracts, (key, existingVal) => existingVal + impliedContracts);
+                        // Thread-safe update allocating flow to Call or Put based on Tick Delta
+                        impliedDealerFlow.AddOrUpdate(targetStrike, 
+                            new FlowData { 
+                                CallVolume = isAskHit ? impliedContracts : 0, 
+                                PutVolume = isBidHit ? impliedContracts : 0 
+                            }, 
+                            (key, oldVal) => new FlowData {
+                                CallVolume = oldVal.CallVolume + (isAskHit ? impliedContracts : 0),
+                                PutVolume = oldVal.PutVolume + (isBidHit ? impliedContracts : 0)
+                            });
                     }
                 }
             }
         }
         #endregion
 
+        #region Background Data Loading
         private async void OnFileCheckTimerTick(object sender, EventArgs e)
         {
             await Task.Run(() =>
@@ -312,6 +332,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
             catch { }
         }
+        #endregion
 
         #region Black-Scholes-Merton Math Engine
         private static double NormPDF(double x) { return Math.Exp(-x * x / 2.0) / Math.Sqrt(2.0 * Math.PI); }
@@ -349,10 +370,10 @@ namespace NinjaTrader.NinjaScript.Indicators
             lock(dataLock) { snap = historicalSnapshots.LastOrDefault(x => x.Timestamp <= Time[0]); }
             if (snap == null) return;
 
-            latestSnapshot = snap; // Sync for OnMarketData
+            latestSnapshot = snap; 
             double basisRatio = snap.BasisRatio;
             
-            // Hack 1: Use Futures price for absolute zero delay
+            // Core Forward Spot
             double nativeSpotPrice = Close[0] / basisRatio; 
             activeImpliedSpot = nativeSpotPrice; 
             
@@ -378,20 +399,53 @@ namespace NinjaTrader.NinjaScript.Indicators
                 double netGex = 0.0, callGex = 0.0, putGex = 0.0, avgLiveIv = 0.0, netVanna = 0.0, netCharm = 0.0;
                 int baseOiTotal = 0, syntheticOiTotal = 0;
 
-                // --- EXTRACT LIVE TICK DEALER FLOW ---
-                double accumulatedLiveDealerContracts = 0.0;
-                impliedDealerFlow.TryGetValue(nativeStrike, out accumulatedLiveDealerContracts);
+                // Grab Localized Dealer Flow
+                FlowData localFlow;
+                if (!impliedDealerFlow.TryGetValue(nativeStrike, out localFlow)) 
+                    localFlow = new FlowData();
 
                 foreach (var opt in kvp.Value)
                 {
                     double T = Math.Max(0.00001, (opt.ExpirationUtc - Time[0].ToUniversalTime()).TotalDays / 365.0);
+                    double daysToExpiry = T * 365.0;
+
+                    // --- HACK 2: Expiration DTE Weighting (Funneling into 0DTE) ---
+                    double timeWeight = Math.Exp(-daysToExpiry / 2.0); 
+                    if (timeWeight < 0.05) timeWeight = 0.05; // Floor for LEAPs
+
+                    double allocatedFlow = opt.IsCall ? (localFlow.CallVolume * timeWeight) : (localFlow.PutVolume * timeWeight);
+
+                    // --- HACK 4: Opening vs Closing (Moneyness & Time Heuristic) ---
+                    bool isITM = opt.IsCall ? (activeImpliedSpot > nativeStrike) : (activeImpliedSpot < nativeStrike);
+                    bool isLateDay = Time[0].Hour >= 14; 
+
+                    int syntheticOI;
+                    if (isITM && isLateDay) 
+                    {
+                        // Probable profit taking/rolling (Closing flow)
+                        syntheticOI = Math.Max(0, opt.OI - (int)allocatedFlow);
+                    }
+                    else 
+                    {
+                        // Probable speculation/hedging (Opening flow)
+                        syntheticOI = opt.OI + (int)allocatedFlow;
+                    }
+
+                    // --- HACK 3: Synthetic Vega (Localized IV Skewing via Flow) ---
+                    double flowRatio = opt.OI > 0 ? (allocatedFlow / opt.OI) : 0;
+                    double ivSpikeMultiplier = 1.0;
                     
-                    // --- THE SYNTHETIC OI EXPLOSION ---
-                    // Base morning OI + Our live Gaussian extrapolated futures flow
-                    int syntheticOI = opt.OI + (int)accumulatedLiveDealerContracts;
+                    if (flowRatio > 0.10) 
+                    {
+                        ivSpikeMultiplier += (flowRatio * 0.5); 
+                        ivSpikeMultiplier = Math.Min(ivSpikeMultiplier, 3.0); // Hard Cap to prevent math explosion
+                    }
+
+                    // Shift IV based on Macro (VIX) + Localized Demand (Flow Ratio)
+                    double shiftedIV = opt.BaseIV * (1.0 - (priceMovePercent * VolSkewFactor)) * vixRatio;
+                    double finalLiveIV = Math.Max(0.01, shiftedIV * ivSpikeMultiplier); 
                     
-                    double finalLiveIV = Math.Max(0.01, (opt.BaseIV * (1.0 - (priceMovePercent * VolSkewFactor))) * vixRatio); 
-                    
+                    // Core BSM Engine Output
                     double gamma = CalculateGamma(activeImpliedSpot, nativeStrike, T, finalLiveIV, q, r);
                     double vanna = CalculateVanna(activeImpliedSpot, nativeStrike, T, finalLiveIV, q, r);
                     
@@ -418,7 +472,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             gexSeries[0] = bd;
         }
 
-        #region Visualization & UI
+        #region Visualization & UI Render
         public override void OnRenderTargetChanged()
         {
             DisposeBrushes();
@@ -499,12 +553,12 @@ namespace NinjaTrader.NinjaScript.Indicators
         {
             if (tooltipTextFormat == null) return;
             string txt = string.Format(
-                "LIVE 0DTE ORDER FLOW ENGINE\n" +
+                "SYNTHETIC MICROSTRUCTURE ENGINE\n" +
                 "───────────────────────────────\n" +
                 "Strike Space:        {0:N0}\n" +
                 "Base OCC OI:         {1:N0}\n" +
-                "Synthetic Live OI:   {2:N0}  <-- Live!\n" +
-                "Sticky-Delta IV:     {3:P1}\n\n" +
+                "Synthetic Live OI:   {2:N0}  <-- Inferred\n" +
+                "Flow-Skewed IV:      {3:P1}\n\n" +
                 "Net $GEX Exposure:   ${4:N0}\n" +
                 "Vanna (per 1% Vol):  ${5:N0}\n" +
                 "Charm (1 Day Decay): ${6:N0}", 
