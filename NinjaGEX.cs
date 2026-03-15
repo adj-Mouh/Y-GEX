@@ -27,20 +27,21 @@ namespace NinjaTrader.NinjaScript.Indicators
         #region Classes & Variables
         public class OptionData
         {
-            public DateTime ExpiryDate; // Precision Time
+            public DateTime ExpiryDate; 
             public bool IsCall;
             public double Strike; 
             public int OI;
-            public double MarketPrice; // Premium for IV calc
-            public double EodIV;       // Fallback IV
+            public double MarketPrice; 
+            public double EodIV;       
         }
 
         public class GexSnapshot
         {
             public double Timestamp;
             public double BasisRatio;  
-            public double RiskFreeRate; // r
-            public double DividendYield; // q
+            public double RiskFreeRate; 
+            public double DividendYield; 
+            public double SnapshotSpot; // السعر المرجعي لحظة جلب البيانات
             public List<OptionData> Options = new List<OptionData>();
         }
 
@@ -70,6 +71,10 @@ namespace NinjaTrader.NinjaScript.Indicators
         public double CutoffPercent { get; set; }
 
         [NinjaScriptProperty]
+        [Display(Name="Skew Sensitivity", Order=3, GroupName="1. Visuals")]
+        public double SkewSensitivity { get; set; }
+
+        [NinjaScriptProperty]
         [Display(Name="TCP Port", Order=1, GroupName="2. System")]
         public int TcpPort { get; set; } 
         #endregion
@@ -78,12 +83,13 @@ namespace NinjaTrader.NinjaScript.Indicators
         {
             if (State == State.SetDefaults)
             {
-                Description = "High-Precision TCP GEX Engine with Newton-Raphson IV & Exact DTE.";
-                Name = "Precision TCP GEX";
+                Description = "High-Precision TCP GEX Engine with Skew Shifting & NR-IV.";
+                Name = "Precision TCP GEX v2";
                 Calculate = Calculate.OnEachTick;
                 IsOverlay = true;
                 DrawOnPricePanel = true;
                 CutoffPercent = 2.0;
+                SkewSensitivity = 1.5; // القيمة الافتراضية المقترحة
                 TcpPort = 9000;
                 DisplayMode = GexDisplayMode.NetGex;
             }
@@ -96,7 +102,6 @@ namespace NinjaTrader.NinjaScript.Indicators
                 positiveBrushes = new SharpDX.Direct2D1.SolidColorBrush[256];
                 negativeBrushes = new SharpDX.Direct2D1.SolidColorBrush[256];
 
-                // Start Reliable TCP Listener
                 isListening = true;
                 tcpTask = Task.Run(() => StartTcpServer());
             }
@@ -108,7 +113,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
         }
 
-        #region TCP Telemetry System (Lossless Data)
+        #region TCP Telemetry System
         private async Task StartTcpServer()
         {
             try 
@@ -119,13 +124,11 @@ namespace NinjaTrader.NinjaScript.Indicators
                 while (isListening)
                 {
                     TcpClient client = await tcpListener.AcceptTcpClientAsync();
-                    // حذفنا الـ _ = لتجنب خطأ التوافقية
                     Task.Run(() => HandleClient(client));
                 }
             }
             catch (Exception ex)
             {
-                // طباعة الخطأ في نافذة الـ Output للتصحيح إذا توقف السيرفر
                 Print("TCP Server Error: " + ex.Message);
             }
         }
@@ -158,7 +161,8 @@ namespace NinjaTrader.NinjaScript.Indicators
                     Timestamp = double.Parse(header[0]),
                     BasisRatio = double.Parse(header[1]),
                     RiskFreeRate = double.Parse(header[2]),
-                    DividendYield = double.Parse(header[3]) // Required for accurate SPX Gamma
+                    DividendYield = double.Parse(header[3]),
+                    SnapshotSpot = header.Length > 4 ? double.Parse(header[4]) : 0 // السعر المرجعي من بايثون
                 };
 
                 for (int i = 1; i < parts.Length; i++)
@@ -168,12 +172,12 @@ namespace NinjaTrader.NinjaScript.Indicators
 
                     newSnap.Options.Add(new OptionData
                     {
-                        ExpiryDate = DateTime.Parse(row[0]), // Expecting Expiry Date, not DTE
+                        ExpiryDate = DateTime.Parse(row[0]),
                         IsCall = row[1] == "1",
                         Strike = double.Parse(row[2]),
                         OI = (int)double.Parse(row[3]),
-                        MarketPrice = double.Parse(row[4]), // Live Premium
-                        EodIV = double.Parse(row[5])        // Fallback EOD IV
+                        MarketPrice = double.Parse(row[4]),
+                        EodIV = double.Parse(row[5])
                     });
                 }
 
@@ -186,7 +190,7 @@ namespace NinjaTrader.NinjaScript.Indicators
         }
         #endregion
 
-        #region Precision Math Engine (Newton-Raphson & Exact Gamma)
+        #region Precision Math Engine with Skew Shifting
         private static double NormPDF(double x) { return Math.Exp(-x * x / 2.0) / Math.Sqrt(2.0 * Math.PI); }
         private static double NormCDF(double x) {
             int sign = x < 0 ? -1 : 1; x = Math.Abs(x) / Math.Sqrt(2.0);
@@ -195,49 +199,50 @@ namespace NinjaTrader.NinjaScript.Indicators
             return 0.5 * (1.0 + sign * y);
         }
 
-        // Exact BSM Price calculation for Newton-Raphson
+        // إزاحة التقلب بناءً على تحرك السعر الحالي عن سعر السناب شوت
+        private double GetShiftedIV(double baseIV, double currentSpot, double referenceSpot)
+        {
+            if (referenceSpot <= 0) return baseIV;
+            
+            // حساب نسبة التغير في السعر
+            double priceShiftPercent = (currentSpot - referenceSpot) / referenceSpot;
+            
+            // Sticky-Delta Assumption: IV ينزاح عكس السعر لتعويض التأخير
+            double shiftedIV = baseIV * (1.0 - (priceShiftPercent * SkewSensitivity));
+            
+            return Math.Max(0.01, Math.Min(2.5, shiftedIV)); // حدود آمنة
+        }
+
         private double CalculateBSMPrice(bool isCall, double S, double K, double T, double v, double r, double q)
         {
             double d1 = (Math.Log(S / K) + (r - q + v * v / 2.0) * T) / (v * Math.Sqrt(T));
             double d2 = d1 - v * Math.Sqrt(T);
-            
-            if (isCall)
-                return S * Math.Exp(-q * T) * NormCDF(d1) - K * Math.Exp(-r * T) * NormCDF(d2);
-            else
-                return K * Math.Exp(-r * T) * NormCDF(-d2) - S * Math.Exp(-q * T) * NormCDF(-d1);
+            return isCall ? (S * Math.Exp(-q * T) * NormCDF(d1) - K * Math.Exp(-r * T) * NormCDF(d2)) 
+                          : (K * Math.Exp(-r * T) * NormCDF(-d2) - S * Math.Exp(-q * T) * NormCDF(-d1));
         }
 
-        // Calculate Vega (Derivative of option price with respect to Volatility)
         private double CalculateVega(double S, double K, double T, double v, double r, double q)
         {
             double d1 = (Math.Log(S / K) + (r - q + v * v / 2.0) * T) / (v * Math.Sqrt(T));
             return S * Math.Exp(-q * T) * NormPDF(d1) * Math.Sqrt(T);
         }
 
-        // Newton-Raphson to find absolute precision Implied Volatility
         private double ImpliedVolatilityNR(bool isCall, double S, double K, double T, double r, double q, double marketPrice, double fallbackIV)
         {
             if (marketPrice <= 0 || T <= 0) return fallbackIV;
-            
-            double sigma = fallbackIV > 0 ? fallbackIV : 0.2; // Initial guess
-            int maxIter = 100;
-            double tol = 1e-5;
-
-            for (int i = 0; i < maxIter; i++)
+            double sigma = fallbackIV > 0 ? fallbackIV : 0.2;
+            for (int i = 0; i < 100; i++)
             {
                 double price = CalculateBSMPrice(isCall, S, K, T, sigma, r, q);
                 double diff = price - marketPrice;
-                if (Math.Abs(diff) < tol) return sigma;
-                
+                if (Math.Abs(diff) < 1e-5) return sigma;
                 double vega = CalculateVega(S, K, T, sigma, r, q);
-                if (vega < 1e-6) break; // Avoid division by zero
-                
-                sigma = sigma - diff / vega;
+                if (vega < 1e-6) break;
+                sigma -= diff / vega;
             }
-            return Math.Max(0.001, sigma); // Floor IV
+            return Math.Max(0.001, sigma);
         }
 
-        // Exact Gamma including Dividend Yield (q)
         private double CalculateExactGamma(double S, double K, double T, double v, double r, double q) {
             if (T <= 0 || v <= 0 || S <= 0 || K <= 0) return 0.0;
             double d1 = (Math.Log(S / K) + (r - q + v * v / 2.0) * T) / (v * Math.Sqrt(T));
@@ -250,7 +255,6 @@ namespace NinjaTrader.NinjaScript.Indicators
             if (CurrentBars[0] < 0 || latestSnapshot == null) return;
             
             double liveEsPrice = Close[0];
-            // Throttling: Calculate only if price moves 0.25 pts to maintain accuracy but save CPU
             if (Math.Abs(liveEsPrice - lastCalcPrice) < 0.25 && (DateTime.Now - lastCalcTime).TotalMilliseconds < 250)
                 return;
                 
@@ -271,20 +275,19 @@ namespace NinjaTrader.NinjaScript.Indicators
             foreach (var opt in snap.Options)
             {
                 double chartStrike = opt.Strike * basis;
-                
-                // 1. Precision Time calculation (down to the minute)
                 double T = (opt.ExpiryDate - currentTime).TotalMinutes / 525600.0;
-                if (T <= 0.0001) continue; // Expired
-                
-                // 2. Exact Volatility Engine (Use NR if premium exists, else fallback)
-                double exactIV = (opt.MarketPrice > 0) 
+                if (T <= 0.0001) continue; 
+
+                // 1. حساب التقلب الأولي (إما عبر NR أو الـ EOD)
+                double baseIV = (opt.MarketPrice > 0) 
                     ? ImpliedVolatilityNR(opt.IsCall, nativeSpot, opt.Strike, T, r, q, opt.MarketPrice, opt.EodIV)
                     : opt.EodIV;
 
-                // 3. Exact Gamma Calculation
-                double gamma = CalculateExactGamma(nativeSpot, opt.Strike, T, exactIV, r, q);
-                
-                // GEX = Gamma * OpenInterest * 100 * SpotPrice
+                // 2. تطبيق خدعة الـ Skew Shifting لتعويض تحرك السعر اللحظي
+                double adjustedIV = GetShiftedIV(baseIV, nativeSpot, snap.SnapshotSpot);
+
+                // 3. حساب الجاما بالتقلب المعدل
+                double gamma = CalculateExactGamma(nativeSpot, opt.Strike, T, adjustedIV, r, q);
                 double gex = gamma * opt.OI * 100.0 * nativeSpot;
 
                 if (!tempNetGex.ContainsKey(chartStrike)) tempNetGex[chartStrike] = 0;
@@ -295,7 +298,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             lock (dataLock) { StrikeNetGex = tempNetGex; }
         }
 
-        #region Hardware-Accelerated Rendering (Unchanged)
+        #region Rendering Logic (Hardware-Accelerated)
         public override void OnRenderTargetChanged()
         {
             DisposeBrushes();
